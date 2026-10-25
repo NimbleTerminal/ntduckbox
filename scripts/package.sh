@@ -20,8 +20,9 @@ case "$engine" in
     *) printf 'Unsupported engine: %s (use duckdb or haybarn)\n' "$engine" >&2; exit 1 ;;
 esac
 archive="ntduckbox_${version}_${platform}_${arch}${suffix}"
-mkdir -p "dist/$archive"
+mkdir -p "dist/$archive/docs"
 CGO_ENABLED=1 GOWORK=off go build -mod=readonly -trimpath -tags "$tags" -ldflags "-X main.version=$version" -o "dist/$archive/ntduckbox" ./cmd/ntduckbox
-cp LICENSE README.md CHANGELOG.md "dist/$archive/"
+cp LICENSE README.md CHANGELOG.md SECURITY.md AGENTS.md CODE_OF_CONDUCT.md "dist/$archive/"
+cp docs/*.md "dist/$archive/docs/"
 tar -czf "dist/$archive.tar.gz" -C dist "$archive"
 printf 'Created dist/%s.tar.gz\n' "$archive"

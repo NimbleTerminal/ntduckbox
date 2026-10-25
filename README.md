@@ -317,7 +317,9 @@ and run `task ci`. To inspect an archive locally without publishing:
 task package VERSION=v0.0.0
 ```
 
-Archives in `dist/` contain the native binary, README, changelog, and license.
+Archives in `dist/` contain the native binary, README, changelog, license,
+security policy, contributor guidance, Code of Conduct, and the guides in
+`docs/`. Relative documentation links retain the repository layout.
 The package task injects the tag into MCP server metadata; local builds report
 `dev`. Hosted release publication requires GitHub Actions to be enabled on the
 repository. The vanity module path must also resolve to this repository before

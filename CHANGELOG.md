@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+ * Include linked documentation in both engine release archives, preserving the `docs/` layout for offline reading.
  * Rename the project to ntduckbox. The module path is now `nimbleterminal.dev/ntduckbox`, the command is `ntduckbox`, and the repository is `NimbleTerminal/ntduckbox`.
  * Lockdown tests now assert the engine's Permission and locked-configuration error types instead of any error, so a mistyped payload cannot pass as a denial.
  * Test the file allowlist against `read_text`, `glob`, `sniff_csv`, `query()`, quoted and identifier file sources, quoted function names, sibling-directory prefixes, traversal, symlinks, and HTTP/S3 paths, through the public API and directly against the engine.
