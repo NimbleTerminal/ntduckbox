@@ -1,6 +1,8 @@
 # CHANGELOG
 
-## Unreleased
+## v0.2.0 (2026-10-25)
+
+Breaking: the module path changed from the v0.1.0 name to `nimbleterminal.dev/ntduckbox`; update imports and `go.mod`.
 
  * Add `QueryWith` with `QueryOptions` for a per-call format, a per-call `MaxRows` capped by the host limit, and opt-in `Truncate`, returning a `Result` with the row count and a `Truncated` flag. Queries now fetch at most one row past the cap from the engine.
  * Add `JSONRows` and `JSONColumnar` formats, serialized by DuckDB's `to_json` so numbers, booleans, and nulls keep native JSON types. Available through `Options.Format`, `QueryFormat`, the MCP `format` argument, and the CLI `-format` flag; `Formats` lists every format.
