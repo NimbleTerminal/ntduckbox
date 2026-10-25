@@ -195,9 +195,24 @@ csv, err := db.Query(ctx,
 ```
 
 CSV and Parquet support bundled into DuckDB works without loading extensions.
-For named views, create them in a trusted preparation step in a persistent
-database, close that writer, then open with ntduckbox. Runtime view creation is
-intentionally absent from the public API.
+
+Hosts can name Parquet files or globs as views in an in-memory database, and
+replace that set at runtime as files appear or disappear, without any SQL:
+
+```go
+err = db.SetParquetViews(ctx, map[string]string{
+    "XNAS.ITCH/ohlcv-1s": "/srv/analytics/cache/XNAS.ITCH/ohlcv-1s/*.parquet",
+})
+csv, err = db.Query(ctx, `SELECT * FROM "XNAS.ITCH/ohlcv-1s" LIMIT 50`)
+```
+
+Each call replaces the whole set: views from earlier calls that are missing from
+the map are dropped, and an empty map drops them all. ntduckbox quotes names and
+paths itself; the host never supplies SQL. The engine binds each view when it is
+created, under the locked settings, so a path outside `AllowedDirs` fails the
+call and the previous set stays in place. File-backed databases are opened
+read-only and reject the call. For views in a persistent database, create them
+in a trusted preparation step, close that writer, then open with ntduckbox.
 
 ## Security considerations
 
@@ -220,6 +235,9 @@ Before returning a DB, Open configures:
 
 There is no user SQL during initialization. Every setting must succeed. DuckDB
 requires the allowlist to be configured before disabling external access.
+`SetParquetViews` is the only host-side catalog change; it takes names and
+paths, not SQL, runs after the lock, and cannot touch settings or file-backed
+databases.
 
 Public queries are wrapped as SELECT subqueries whose columns are cast to VARCHAR,
 then checked with DuckDB's native single-statement preparation API before execution. This is deliberately not a

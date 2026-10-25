@@ -8,10 +8,13 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,6 +33,10 @@ type Options struct {
 type DB struct {
 	pool *sql.DB
 	opts Options
+
+	viewsMu sync.Mutex
+	views   map[string]struct{} // Names created by SetParquetViews.
+	memory  bool
 }
 
 // Open opens an existing file read-only or creates an empty in-memory database.
@@ -81,7 +88,8 @@ func Open(opts Options) (*DB, error) {
 		"allow_unsigned_extensions": {"false"}, "allow_community_extensions": {"false"},
 	}
 	path := opts.Path
-	if path == "" || path == ":memory:" {
+	memory := path == "" || path == ":memory:"
+	if memory {
 		path = ":memory:"
 		config.Set("access_mode", "read_write")
 	} else {
@@ -114,8 +122,69 @@ func Open(opts Options) (*DB, error) {
 			return fail(fmt.Errorf("lockdown: %w", err))
 		}
 	}
-	return &DB{pool: pool, opts: opts}, nil
+	return &DB{pool: pool, opts: opts, memory: memory}, nil
 }
+
+// SetParquetViews replaces the host-defined views of an in-memory database.
+// Keys are view names in the main schema; values are Parquet file paths or
+// globs inside AllowedDirs. Views from earlier calls that are absent from views
+// are dropped. The engine binds every view at creation, so a path outside
+// AllowedDirs fails the whole call and leaves the previous set in place.
+// File-backed databases are opened read-only and return an error.
+func (db *DB) SetParquetViews(ctx context.Context, views map[string]string) error {
+	if !db.memory {
+		return errors.New("views require an in-memory database")
+	}
+	for name, path := range views {
+		if name == "" || path == "" {
+			return errors.New("view names and paths must not be empty")
+		}
+	}
+	db.viewsMu.Lock()
+	defer db.viewsMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
+	defer cancel()
+	conn, err := db.pool.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
+		return err
+	}
+	apply := func() error {
+		for _, name := range slices.Sorted(maps.Keys(db.views)) {
+			if _, ok := views[name]; ok {
+				continue
+			}
+			if _, err := conn.ExecContext(ctx, "DROP VIEW IF EXISTS main."+identifier(name)); err != nil {
+				return err
+			}
+		}
+		for _, name := range slices.Sorted(maps.Keys(views)) {
+			stmt := "CREATE OR REPLACE VIEW main." + identifier(name) + " AS SELECT * FROM read_parquet(" + literal(views[name]) + ")"
+			if _, err := conn.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		_, err := conn.ExecContext(ctx, "COMMIT")
+		return err
+	}
+	if err := apply(); err != nil {
+		if _, rbErr := conn.ExecContext(context.Background(), "ROLLBACK"); rbErr != nil {
+			// Never return a connection with unknown transaction state to the pool.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		return fmt.Errorf("set views: %w", err)
+	}
+	db.views = make(map[string]struct{}, len(views))
+	for name := range views {
+		db.views[name] = struct{}{}
+	}
+	return nil
+}
+
+func identifier(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
 
 func literal(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 
@@ -207,7 +276,7 @@ func (db *DB) DescribeTable(ctx context.Context, names ...string) (string, error
 	}
 	parts := make([]string, len(names))
 	for i, name := range names {
-		parts[i] = `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+		parts[i] = identifier(name)
 	}
 	return db.Describe(ctx, "SELECT * FROM "+strings.Join(parts, "."))
 }

@@ -18,6 +18,9 @@ Read README.md for the public contract and threat model.
   directories before disabling external access; lock configuration last.
 - Keep the underlying pool private. No write-access option, arbitrary startup
   SQL, runtime extension loading, or user-controlled configuration changes.
+  `SetParquetViews` is the one host-side catalog mutation: structured names and
+  paths only, in-memory databases only, transactional, and bound by the engine
+  under the locked settings. Do not extend it to accept SQL.
 - Preserve native single-statement validation. The driver's PrepareContext can
   execute batch prefixes; it is not a safe replacement for Conn.Prepare here.
 - Keep transaction rollback and bad-connection disposal on every exit path.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -298,4 +299,100 @@ func TestEngine(t *testing.T) {
 		t.Fatalf("%s engine version: %q %v", Engine, got, err)
 	}
 	t.Logf("engine=%s %s", Engine, strings.TrimSpace(strings.TrimPrefix(got, "v\n")))
+}
+
+func writeParquet(tb testing.TB, path string, n int) {
+	tb.Helper()
+	seed, err := sql.Open("duckdb", "")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer seed.Close()
+	if _, err := seed.Exec("COPY (SELECT " + strconv.Itoa(n) + " AS n) TO " + literal(path) + " (FORMAT PARQUET)"); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+func TestSetParquetViews(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	writeParquet(t, filepath.Join(dir, "a.parquet"), 1)
+	writeParquet(t, filepath.Join(dir, "b.parquet"), 2)
+	db := openTest(t, Options{AllowedDirs: []string{dir}})
+
+	// Names may contain slashes and quotes; values may be globs.
+	views := map[string]string{
+		`XNAS.ITCH/ohlcv-1s`: filepath.Join(dir, "a.parquet"),
+		`odd"name`:           filepath.Join(dir, "*.parquet"),
+	}
+	if err := db.SetParquetViews(ctx, views); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.Query(ctx, `SELECT n FROM "XNAS.ITCH/ohlcv-1s"`); err != nil || got != "n\n1\n" {
+		t.Fatalf("%q %v", got, err)
+	}
+	if got, err := db.Query(ctx, `SELECT count(*) AS c FROM "odd""name"`); err != nil || got != "c\n2\n" {
+		t.Fatalf("%q %v", got, err)
+	}
+	if got, err := db.ListViews(ctx); err != nil || got != "table_catalog,table_schema,table_name\nmemory,main,XNAS.ITCH/ohlcv-1s\nmemory,main,\"odd\"\"name\"\n" {
+		t.Fatalf("%q %v", got, err)
+	}
+
+	// A later call replaces the whole set: changed definitions are rebound and
+	// omitted names are dropped.
+	if err := db.SetParquetViews(ctx, map[string]string{`XNAS.ITCH/ohlcv-1s`: filepath.Join(dir, "b.parquet")}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.Query(ctx, `SELECT n FROM "XNAS.ITCH/ohlcv-1s"`); err != nil || got != "n\n2\n" {
+		t.Fatalf("%q %v", got, err)
+	}
+	if _, err := db.Query(ctx, `SELECT * FROM "odd""name"`); err == nil {
+		t.Fatal("dropped view still queryable")
+	}
+
+	// Paths outside AllowedDirs are rejected by the engine at creation time,
+	// and a failed call leaves the previous set untouched.
+	outside := filepath.Join(t.TempDir(), "x.parquet")
+	writeParquet(t, outside, 3)
+	err := db.SetParquetViews(ctx, map[string]string{"ok": filepath.Join(dir, "a.parquet"), "bad": outside})
+	if err == nil {
+		t.Fatal("view outside allowed directories created")
+	}
+	if _, err := db.Query(ctx, `SELECT * FROM ok`); err == nil {
+		t.Fatal("partial view set applied after failure")
+	}
+	if got, err := db.Query(ctx, `SELECT n FROM "XNAS.ITCH/ohlcv-1s"`); err != nil || got != "n\n2\n" {
+		t.Fatalf("%q %v", got, err)
+	}
+
+	// An empty map removes every managed view.
+	if err := db.SetParquetViews(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.ListViews(ctx); err != nil || got != "table_catalog,table_schema,table_name\n" {
+		t.Fatalf("%q %v", got, err)
+	}
+}
+
+func TestSetParquetViewsRejectsFileBacked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db.duckdb")
+	seed, err := sql.Open("duckdb", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Exec("CREATE TABLE t AS SELECT 1 AS n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeParquet(t, filepath.Join(dir, "a.parquet"), 1)
+	db := openTest(t, Options{Path: path, AllowedDirs: []string{dir}})
+	if err := db.SetParquetViews(context.Background(), map[string]string{"v": filepath.Join(dir, "a.parquet")}); err == nil {
+		t.Fatal("views created in a read-only file-backed database")
+	}
+	if _, err := db.Query(context.Background(), "SELECT * FROM v"); err == nil {
+		t.Fatal("view exists in file-backed database")
+	}
 }
