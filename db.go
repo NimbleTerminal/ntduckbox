@@ -57,8 +57,8 @@ func Open(opts Options) (*DB, error) {
 	if opts.Format == "" {
 		opts.Format = CSV
 	}
-	if opts.Format != CSV && opts.Format != Markdown {
-		return nil, errors.New("format must be csv or markdown")
+	if !opts.Format.valid() {
+		return nil, errors.New("format must be csv, markdown, json_rows, or json_columnar")
 	}
 	dirs := make([]string, 0, len(opts.AllowedDirs))
 	for _, dir := range opts.AllowedDirs {
@@ -203,8 +203,8 @@ func (db *DB) QueryFormat(ctx context.Context, query string, format Format) (str
 }
 
 func (db *DB) run(ctx context.Context, query string, format Format, describe bool) (string, error) {
-	if format != CSV && format != Markdown {
-		return "", errors.New("format must be csv or markdown")
+	if !format.valid() {
+		return "", errors.New("format must be csv, markdown, json_rows, or json_columnar")
 	}
 	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
 	defer cancel()
@@ -231,6 +231,15 @@ func (db *DB) run(ctx context.Context, query string, format Format, describe boo
 	if describe {
 		wrapped = "SELECT * FROM " + inner
 	}
+	if format.isJSON() {
+		// JSON wraps the same SELECT in an outer SELECT, so the executed
+		// statement is the one validated below, including DESCRIBE.
+		source := "SELECT * FROM " + inner
+		if describe {
+			source = "DESCRIBE " + source
+		}
+		wrapped = jsonQuery(source, format, db.opts.MaxRows)
+	}
 	// Conn.Prepare (unlike PrepareContext) extracts exactly one statement and
 	// rejects batches without executing their leading statements. Do not replace
 	// this with database/sql.PrepareContext: the driver executes batch prefixes.
@@ -252,7 +261,7 @@ func (db *DB) run(ctx context.Context, query string, format Format, describe boo
 	if err != nil {
 		return "", fmt.Errorf("query rejected: %w", err)
 	}
-	if describe {
+	if describe && !format.isJSON() {
 		wrapped = "DESCRIBE " + wrapped
 	}
 	rows, err := conn.QueryContext(ctx, wrapped)
@@ -260,6 +269,9 @@ func (db *DB) run(ctx context.Context, query string, format Format, describe boo
 		return "", err
 	}
 	defer rows.Close()
+	if format.isJSON() {
+		return renderJSON(rows, db.opts.MaxRows, db.opts.MaxChars)
+	}
 	return render(ctx, rows, format, db.opts.MaxRows, db.opts.MaxChars)
 }
 

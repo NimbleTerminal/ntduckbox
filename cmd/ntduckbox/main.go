@@ -28,7 +28,7 @@ func main() {
 	flag.IntVar(&opts.MaxRows, "max-rows", 1000, "maximum result rows")
 	flag.IntVar(&opts.MaxChars, "max-chars", 100000, "maximum UTF-8 output bytes")
 	flag.DurationVar(&opts.QueryTimeout, "timeout", 10*time.Second, "query timeout")
-	flag.StringVar(&format, "format", "csv", "csv or markdown")
+	flag.StringVar(&format, "format", "csv", "csv, markdown, json_rows, or json_columnar")
 	flag.Parse()
 	opts.AllowedDirs = dirs
 	opts.Format = ntduckbox.Format(format)

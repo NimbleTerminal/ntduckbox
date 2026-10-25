@@ -48,3 +48,32 @@ func TestMCPTools(t *testing.T) {
 		}
 	}
 }
+
+func TestMCPQueryFormats(t *testing.T) {
+	db := openTest(t, Options{})
+	s := server.NewMCPServer("test", "1")
+	if err := db.RegisterTools(s); err != nil {
+		t.Fatal(err)
+	}
+	tool := s.ListTools()["query"]
+	prop, _ := tool.Tool.InputSchema.Properties["format"].(map[string]any)
+	enum, _ := prop["enum"].([]string)
+	if len(enum) != len(Formats) {
+		t.Fatalf("format enum %v", prop)
+	}
+	for i, f := range Formats {
+		if enum[i] != string(f) {
+			t.Fatalf("format enum %v", enum)
+		}
+	}
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "query"
+	req.Params.Arguments = map[string]any{"sql": "SELECT 1 AS n", "format": "json_rows"}
+	result, err := tool.Handler(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text, ok := result.Content[0].(mcp.TextContent); !ok || result.IsError || text.Text != `[{"n":1}]` {
+		t.Fatalf("%#v", result)
+	}
+}

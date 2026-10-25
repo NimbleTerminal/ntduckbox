@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+ * Add `JSONRows` and `JSONColumnar` formats, serialized by DuckDB's `to_json` so numbers, booleans, and nulls keep native JSON types. Available through `Options.Format`, `QueryFormat`, the MCP `format` argument, and the CLI `-format` flag; `Formats` lists every format.
  * Add `SetParquetViews` so hosts can define and replace Parquet-backed views in an in-memory database at runtime from names and paths, with no host SQL, no second driver connection, and no reopen. Paths outside `AllowedDirs` fail the call and leave the previous views in place; file-backed databases reject it.
  * Include linked documentation in both engine release archives, preserving the `docs/` layout for offline reading.
  * Rename the project to ntduckbox. The module path is now `nimbleterminal.dev/ntduckbox`, the command is `ntduckbox`, and the repository is `NimbleTerminal/ntduckbox`.

@@ -6,6 +6,8 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -17,7 +19,50 @@ const (
 	CSV Format = "csv"
 	// Markdown emits a pipe-delimited Markdown table.
 	Markdown Format = "markdown"
+	// JSONRows emits a JSON array of row objects keyed by column name, with
+	// DuckDB's native JSON typing. No header row.
+	JSONRows Format = "json_rows"
+	// JSONColumnar emits one JSON object keyed by column name whose values are
+	// arrays of that column's values, with DuckDB's native JSON typing.
+	JSONColumnar Format = "json_columnar"
 )
+
+// Formats lists every supported Format in declaration order.
+var Formats = []Format{CSV, Markdown, JSONRows, JSONColumnar}
+
+func (f Format) valid() bool  { return slices.Contains(Formats, f) }
+func (f Format) isJSON() bool { return f == JSONRows || f == JSONColumnar }
+
+// jsonQuery wraps a validated SELECT so DuckDB serializes at most maxRows+1
+// rows as JSON in one cell, with the row count alongside for limit checks.
+// DuckDB's to_json keeps native numbers, booleans, and nulls; everything else
+// uses its text rendering. Duplicate column names are suffixed by DuckDB.
+func jsonQuery(source string, format Format, maxRows int) string {
+	rows := "WITH ntduckbox_rows AS (SELECT * FROM (" + source + ") LIMIT " + strconv.Itoa(maxRows+1) + ") SELECT (SELECT count(*) FROM ntduckbox_rows), "
+	if format == JSONColumnar {
+		return rows + "to_json(t)::VARCHAR FROM (SELECT coalesce(list(COLUMNS(*)), []) FROM ntduckbox_rows) AS t"
+	}
+	return rows + "coalesce(to_json(list(t)), '[]')::VARCHAR FROM ntduckbox_rows AS t"
+}
+
+// renderJSON reads the single cell produced by jsonQuery within the limits.
+func renderJSON(rows *sql.Rows, maxRows, maxChars int) (string, error) {
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", err
+		}
+		return "", errors.New("json result missing")
+	}
+	var count int64
+	var text string
+	if err := rows.Scan(&count, &text); err != nil {
+		return "", err
+	}
+	if count > int64(maxRows) || len(text) > maxChars {
+		return "", ErrResultLimit
+	}
+	return text, rows.Err()
+}
 
 // ErrResultLimit means no partial result was returned. Add a SQL LIMIT, select
 // fewer columns, or increase the host-configured limits.

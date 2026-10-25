@@ -25,7 +25,7 @@ func (db *DB) RegisterTools(s *server.MCPServer) error {
 		}
 		return mcp.NewToolResultText(text), nil
 	}
-	s.AddTool(mcp.NewTool("query", mcp.WithDescription("Run one read-only SELECT query. Results are bounded; use SQL LIMIT for large tables."), mcp.WithReadOnlyHintAnnotation(true), mcp.WithString("sql", mcp.Required()), mcp.WithString("format", mcp.Enum("csv", "markdown"))), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.AddTool(mcp.NewTool("query", mcp.WithDescription("Run one read-only SELECT query. Results are bounded; use SQL LIMIT for large tables."), mcp.WithReadOnlyHintAnnotation(true), mcp.WithString("sql", mcp.Required()), mcp.WithString("format", mcp.Enum(formatNames()...))), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, err := req.RequireString("sql")
 		if err != nil {
 			return result("", err)
@@ -85,4 +85,12 @@ func (db *DB) RegisterTools(s *server.MCPServer) error {
 		return result(text, err)
 	})
 	return nil
+}
+
+func formatNames() []string {
+	names := make([]string, len(Formats))
+	for i, f := range Formats {
+		names[i] = string(f)
+	}
+	return names
 }

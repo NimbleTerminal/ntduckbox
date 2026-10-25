@@ -90,17 +90,29 @@ serializes queries through one connection, and waiting counts toward the timeout
 Pass a context to cancel a request earlier than the host-configured deadline.
 
 Zero limits select the defaults shown above; negatives are errors. CSV is the
-default format. `QueryFormat(ctx, sql, ntduckbox.Markdown)` selects Markdown for
-one call. `Describe(ctx, sql)` returns a query schema;
+default format. `QueryFormat(ctx, sql, ntduckbox.Markdown)` selects a format for
+one call: `CSV`, `Markdown`, `JSONRows`, or `JSONColumnar` (see `Formats`). `Describe(ctx, sql)` returns a query schema;
 `DescribeTable(ctx, "main", "events")` quotes each identifier component safely.
 
-Both formats include headers. DuckDB casts every value to VARCHAR before
+CSV and Markdown include headers. DuckDB casts every value to VARCHAR before
 encoding, so dates, timestamps, intervals, lists, structs, and blobs use DuckDB's
 text rendering rather than Go's. SQL NULL is rendered as `NULL` (indistinguishable
 from that literal string), and a lone empty string is written as a quoted `""` in
-CSV so readers keep the row. MaxChars counts UTF-8 bytes, including headers and
-escaping. Results exceeding either limit return `ErrResultLimit` with no partial
-output. Add a SQL `LIMIT` or select fewer columns. Trailing semicolons are ignored.
+CSV so readers keep the row.
+
+`JSONRows` returns a JSON array of row objects, `[{"n":1,"s":"x"}]`, and
+`JSONColumnar` one object of column arrays, `{"n":[1],"s":["x"]}`. Both are
+serialized by DuckDB's `to_json`, so numbers, booleans, nulls, lists, and structs
+keep native JSON types while dates, timestamps, intervals, and blobs are strings.
+Empty results are `[]` and `{"n":[]}`. Row order follows the query's `ORDER BY`.
+DuckDB suffixes duplicate column names (`n`, `n_1`) and writes non-finite doubles
+as bare `Infinity` or `NaN`, which strict parsers reject; cast or filter them in
+SQL. `Describe`, `ListTables`, and `ListViews` return their rows in the same
+format.
+
+MaxChars counts UTF-8 bytes, including headers and escaping. Results exceeding
+either limit return `ErrResultLimit` with no partial output. Add a SQL `LIMIT`
+or select fewer columns. Trailing semicolons are ignored.
 
 An empty Path or `:memory:` creates an empty in-memory database. DuckDB does not
 support opening an in-memory database with `access_mode=read_only`; internally
@@ -129,7 +141,7 @@ existing tools with any of these names cause registration to fail.
 
 | Tool | Arguments |
 | --- | --- |
-| `query` | Required `sql`; optional `format`: `csv` or `markdown` |
+| `query` | Required `sql`; optional `format`: `csv`, `markdown`, `json_rows`, or `json_columnar` |
 | `list_tables` | None |
 | `list_views` | None |
 | `describe` | Exactly one of `sql` or `table`; optional `schema` with `table` |

@@ -29,7 +29,8 @@ Read README.md for the public contract and threat model.
 - `format.go` owns bounded, all-or-error CSV/Markdown output. Limits include
   headers and escaping. They do not bound engine allocations or intermediate data.
   Query values are cast to VARCHAR by DuckDB; keep its text rendering rather than
-  reformatting typed values in Go.
+  reformatting typed values in Go. JSON formats likewise serialize in DuckDB with
+  `to_json`, as one cell plus a row count; do not re-encode typed values in Go.
 - `mcp.go` registers four tools on a host-owned server. Return tool errors through
   NewToolResultError; agents must not override host limits or security settings.
 - Keep CLI logging on stderr using slog. Stdout belongs to the MCP transport.

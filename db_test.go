@@ -396,3 +396,70 @@ func TestSetParquetViewsRejectsFileBacked(t *testing.T) {
 		t.Fatal("view exists in file-backed database")
 	}
 }
+
+func TestJSONRows(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t, Options{Format: JSONRows})
+	// Native JSON types survive; no header row.
+	got, err := db.Query(ctx, "SELECT 1 AS n, 1.5 AS f, true AS b, NULL AS z, 'x' AS s")
+	if err != nil || got != `[{"n":1,"f":1.5,"b":true,"z":null,"s":"x"}]` {
+		t.Fatalf("%q %v", got, err)
+	}
+	if got, err := db.Query(ctx, "SELECT 1 AS n WHERE false"); err != nil || got != "[]" {
+		t.Fatalf("%q %v", got, err)
+	}
+	// Row order follows the query's ORDER BY.
+	if got, err := db.Query(ctx, "SELECT i FROM range(3) r(i) ORDER BY i DESC"); err != nil || got != `[{"i":2},{"i":1},{"i":0}]` {
+		t.Fatalf("%q %v", got, err)
+	}
+	// User CTEs are untouched by the wrapper.
+	if got, err := db.Query(ctx, "WITH x AS (SELECT 7 AS n) SELECT n FROM x;"); err != nil || got != `[{"n":7}]` {
+		t.Fatalf("%q %v", got, err)
+	}
+	if got, err := db.Describe(ctx, "SELECT 1 AS n"); err != nil || !strings.HasPrefix(got, `[{"column_name":"n","column_type":"INTEGER"`) {
+		t.Fatalf("%q %v", got, err)
+	}
+	if got, err := db.ListViews(ctx); err != nil || got != "[]" {
+		t.Fatalf("%q %v", got, err)
+	}
+	if _, err := db.Query(ctx, "SELECT 1; SELECT 2"); err == nil {
+		t.Fatal("batch accepted")
+	}
+	if _, err := db.Query(ctx, "CREATE TABLE t (n INT)"); err == nil {
+		t.Fatal("DDL accepted")
+	}
+}
+
+func TestJSONColumnar(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t, Options{})
+	got, err := db.QueryFormat(ctx, "SELECT i AS n, 'x' || i AS s FROM range(2) r(i) ORDER BY i", JSONColumnar)
+	if err != nil || got != `{"n":[0,1],"s":["x0","x1"]}` {
+		t.Fatalf("%q %v", got, err)
+	}
+	if got, err := db.QueryFormat(ctx, "SELECT 1 AS n, 'x' AS s WHERE false", JSONColumnar); err != nil || got != `{"n":[],"s":[]}` {
+		t.Fatalf("%q %v", got, err)
+	}
+	if got, err := db.QueryFormat(ctx, "SELECT NULL AS z", JSONColumnar); err != nil || got != `{"z":[null]}` {
+		t.Fatalf("%q %v", got, err)
+	}
+}
+
+func TestJSONLimits(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t, Options{MaxRows: 2, MaxChars: 40})
+	for _, format := range []Format{JSONRows, JSONColumnar} {
+		if _, err := db.QueryFormat(ctx, "SELECT i FROM range(2) r(i)", format); err != nil {
+			t.Fatal(format, err)
+		}
+		if _, err := db.QueryFormat(ctx, "SELECT i FROM range(3) r(i)", format); !errors.Is(err, ErrResultLimit) {
+			t.Fatalf("%s rows: %v", format, err)
+		}
+		if _, err := db.QueryFormat(ctx, "SELECT repeat('x', 50) AS s", format); !errors.Is(err, ErrResultLimit) {
+			t.Fatalf("%s chars: %v", format, err)
+		}
+	}
+	if _, err := Open(Options{Format: "json"}); err == nil {
+		t.Fatal("unknown format accepted")
+	}
+}
