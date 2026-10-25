@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -191,6 +192,24 @@ func literal(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + 
 // Close releases the database and waits for active queries to finish.
 func (db *DB) Close() error { return db.pool.Close() }
 
+// QueryOptions adjusts one call. Zero values use the Options defaults.
+type QueryOptions struct {
+	Format  Format // Result encoding.
+	MaxRows int    // Row cap for this call; must not exceed Options.MaxRows.
+	// Truncate returns the rows that fit instead of ErrResultLimit and sets
+	// Result.Truncated. CSV and Markdown stop at the last whole row within
+	// both limits; JSON formats stop at MaxRows rows but a result over
+	// MaxChars is still an error.
+	Truncate bool
+}
+
+// Result is a rendered query result.
+type Result struct {
+	Text      string
+	Rows      int  // Data rows in Text.
+	Truncated bool // More rows existed than Text holds; only with Truncate.
+}
+
 // Query returns a bounded result using the configured default format.
 func (db *DB) Query(ctx context.Context, query string) (string, error) {
 	return db.QueryFormat(ctx, query, db.opts.Format)
@@ -199,23 +218,40 @@ func (db *DB) Query(ctx context.Context, query string) (string, error) {
 // QueryFormat executes one SELECT-style query. Commands, multiple statements,
 // writes, and configuration changes are rejected. Oversized results return errors.
 func (db *DB) QueryFormat(ctx context.Context, query string, format Format) (string, error) {
-	return db.run(ctx, query, format, false)
+	res, err := db.QueryWith(ctx, query, QueryOptions{Format: format})
+	return res.Text, err
 }
 
-func (db *DB) run(ctx context.Context, query string, format Format, describe bool) (string, error) {
-	if !format.valid() {
-		return "", errors.New("format must be csv, markdown, json_rows, or json_columnar")
+// QueryWith executes one SELECT-style query with per-call options. The host
+// limits from Open remain the ceiling; a larger MaxRows is an error.
+func (db *DB) QueryWith(ctx context.Context, query string, opts QueryOptions) (Result, error) {
+	return db.run(ctx, query, opts, false)
+}
+
+func (db *DB) run(ctx context.Context, query string, opts QueryOptions, describe bool) (Result, error) {
+	if opts.Format == "" {
+		opts.Format = db.opts.Format
 	}
+	if !opts.Format.valid() {
+		return Result{}, errors.New("format must be csv, markdown, json_rows, or json_columnar")
+	}
+	if opts.MaxRows < 0 || opts.MaxRows > db.opts.MaxRows {
+		return Result{}, fmt.Errorf("max rows must be between 0 and %d", db.opts.MaxRows)
+	}
+	if opts.MaxRows == 0 {
+		opts.MaxRows = db.opts.MaxRows
+	}
+	format := opts.Format
 	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
 	defer cancel()
 	conn, err := db.pool.Conn(ctx)
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	defer conn.Close()
 	// DuckDB's Go BeginTx does not support ReadOnly, but the SQL engine does.
 	if _, err = conn.ExecContext(ctx, "BEGIN TRANSACTION READ ONLY"); err != nil {
-		return "", err
+		return Result{}, err
 	}
 	defer func() {
 		if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
@@ -227,7 +263,9 @@ func (db *DB) run(ctx context.Context, query string, format Format, describe boo
 	inner := "(\n" + query + "\n) AS ntduckbox_query"
 	// DuckDB casts every value to VARCHAR so results use its canonical text
 	// rendering (dates, intervals, lists, structs, blobs) rather than Go's.
-	wrapped := "SELECT COLUMNS(*)::VARCHAR FROM " + inner
+	// One row past the cap is enough to detect overflow without materializing
+	// the rest of the result in the driver.
+	wrapped := "SELECT COLUMNS(*)::VARCHAR FROM " + inner + " LIMIT " + strconv.Itoa(opts.MaxRows+1)
 	if describe {
 		wrapped = "SELECT * FROM " + inner
 	}
@@ -238,7 +276,7 @@ func (db *DB) run(ctx context.Context, query string, format Format, describe boo
 		if describe {
 			source = "DESCRIBE " + source
 		}
-		wrapped = jsonQuery(source, format, db.opts.MaxRows)
+		wrapped = jsonQuery(source, format, opts.MaxRows)
 	}
 	// Conn.Prepare (unlike PrepareContext) extracts exactly one statement and
 	// rejects batches without executing their leading statements. Do not replace
@@ -259,25 +297,26 @@ func (db *DB) run(ctx context.Context, query string, format Format, describe boo
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("query rejected: %w", err)
+		return Result{}, fmt.Errorf("query rejected: %w", err)
 	}
 	if describe && !format.isJSON() {
 		wrapped = "DESCRIBE " + wrapped
 	}
 	rows, err := conn.QueryContext(ctx, wrapped)
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	defer rows.Close()
 	if format.isJSON() {
-		return renderJSON(rows, db.opts.MaxRows, db.opts.MaxChars)
+		return renderJSON(rows, opts.MaxRows, db.opts.MaxChars, opts.Truncate)
 	}
-	return render(ctx, rows, format, db.opts.MaxRows, db.opts.MaxChars)
+	return render(ctx, rows, format, opts.MaxRows, db.opts.MaxChars, opts.Truncate)
 }
 
 // Describe returns the schema of a SELECT-style query without executing its rows.
 func (db *DB) Describe(ctx context.Context, query string) (string, error) {
-	return db.run(ctx, query, db.opts.Format, true)
+	res, err := db.run(ctx, query, QueryOptions{}, true)
+	return res.Text, err
 }
 
 // DescribeTable describes a relation. Each argument is one literal identifier,

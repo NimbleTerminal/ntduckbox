@@ -98,7 +98,8 @@ func FuzzResultFormatting(f *testing.F) {
 				t.Fatal(err)
 			}
 			defer rows.Close()
-			return render(context.Background(), rows, format, rowsLimit, charsLimit)
+			res, err := render(context.Background(), rows, format, rowsLimit, charsLimit, false)
+			return res.Text, err
 		}
 		full, err := renderBounded(5, 100000)
 		if err != nil {

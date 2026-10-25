@@ -38,30 +38,36 @@ func (f Format) isJSON() bool { return f == JSONRows || f == JSONColumnar }
 // DuckDB's to_json keeps native numbers, booleans, and nulls; everything else
 // uses its text rendering. Duplicate column names are suffixed by DuckDB.
 func jsonQuery(source string, format Format, maxRows int) string {
-	rows := "WITH ntduckbox_rows AS (SELECT * FROM (" + source + ") LIMIT " + strconv.Itoa(maxRows+1) + ") SELECT (SELECT count(*) FROM ntduckbox_rows), "
+	rows := "WITH ntduckbox_rows AS (SELECT * FROM (" + source + ") LIMIT " + strconv.Itoa(maxRows+1) + "), " +
+		"ntduckbox_page AS (SELECT * FROM ntduckbox_rows LIMIT " + strconv.Itoa(maxRows) + ") " +
+		"SELECT (SELECT count(*) FROM ntduckbox_rows), "
 	if format == JSONColumnar {
-		return rows + "to_json(t)::VARCHAR FROM (SELECT coalesce(list(COLUMNS(*)), []) FROM ntduckbox_rows) AS t"
+		return rows + "to_json(t)::VARCHAR FROM (SELECT coalesce(list(COLUMNS(*)), []) FROM ntduckbox_page) AS t"
 	}
-	return rows + "coalesce(to_json(list(t)), '[]')::VARCHAR FROM ntduckbox_rows AS t"
+	return rows + "coalesce(to_json(list(t)), '[]')::VARCHAR FROM ntduckbox_page AS t"
 }
 
 // renderJSON reads the single cell produced by jsonQuery within the limits.
-func renderJSON(rows *sql.Rows, maxRows, maxChars int) (string, error) {
+func renderJSON(rows *sql.Rows, maxRows, maxChars int, truncate bool) (Result, error) {
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
-			return "", err
+			return Result{}, err
 		}
-		return "", errors.New("json result missing")
+		return Result{}, errors.New("json result missing")
 	}
-	var count int64
+	var count int
 	var text string
 	if err := rows.Scan(&count, &text); err != nil {
-		return "", err
+		return Result{}, err
 	}
-	if count > int64(maxRows) || len(text) > maxChars {
-		return "", ErrResultLimit
+	if err := rows.Err(); err != nil {
+		return Result{}, err
 	}
-	return text, rows.Err()
+	res := Result{Text: text, Rows: min(count, maxRows), Truncated: count > maxRows}
+	if (res.Truncated && !truncate) || len(text) > maxChars {
+		return Result{}, ErrResultLimit
+	}
+	return res, nil
 }
 
 // ErrResultLimit means no partial result was returned. Add a SQL LIMIT, select
@@ -71,11 +77,12 @@ var ErrResultLimit = errors.New("result exceeds configured row or character limi
 // markdownEscaper keeps cell content inside its table cell and on one line.
 var markdownEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\\", "&#92;", "|", "&#124;", "\r", "&#13;", "\n", "<br>")
 
-// render encodes rows all-or-error within maxRows and maxChars (UTF-8 bytes).
-func render(ctx context.Context, rows *sql.Rows, format Format, maxRows, maxChars int) (string, error) {
+// render encodes rows within maxRows and maxChars (UTF-8 bytes): all-or-error,
+// or with truncate the whole rows that fit, flagged in Result.Truncated.
+func render(ctx context.Context, rows *sql.Rows, format Format, maxRows, maxChars int, truncate bool) (Result, error) {
 	cols, err := rows.Columns()
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	var out strings.Builder
 	appendRow := func(fields []string) error {
@@ -112,7 +119,7 @@ func render(ctx context.Context, rows *sql.Rows, format Format, maxRows, maxChar
 		return nil
 	}
 	if err := appendRow(cols); err != nil {
-		return "", err
+		return Result{}, err
 	}
 	if format == Markdown {
 		separators := make([]string, len(cols))
@@ -120,7 +127,7 @@ func render(ctx context.Context, rows *sql.Rows, format Format, maxRows, maxChar
 			separators[i] = "---"
 		}
 		if err := appendRow(separators); err != nil {
-			return "", err
+			return Result{}, err
 		}
 	}
 	values := make([]any, len(cols))
@@ -128,17 +135,20 @@ func render(ctx context.Context, rows *sql.Rows, format Format, maxRows, maxChar
 	for i := range values {
 		dest[i] = &values[i]
 	}
-	count := 0
+	res := Result{}
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return Result{}, err
 		}
-		if count >= maxRows {
-			return "", ErrResultLimit
+		if res.Rows >= maxRows {
+			if truncate {
+				res.Truncated = true
+				break
+			}
+			return Result{}, ErrResultLimit
 		}
-		count++
 		if err := rows.Scan(dest...); err != nil {
-			return "", err
+			return Result{}, err
 		}
 		fields := make([]string, len(cols))
 		for i, v := range values {
@@ -152,14 +162,20 @@ func render(ctx context.Context, rows *sql.Rows, format Format, maxRows, maxChar
 			}
 		}
 		if err := appendRow(fields); err != nil {
-			return "", err
+			if truncate && errors.Is(err, ErrResultLimit) {
+				res.Truncated = true
+				break
+			}
+			return Result{}, err
 		}
+		res.Rows++
 	}
 	if err := rows.Err(); err != nil {
-		return "", err
+		return Result{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return Result{}, err
 	}
-	return out.String(), nil
+	res.Text = out.String()
+	return res, nil
 }

@@ -463,3 +463,61 @@ func TestJSONLimits(t *testing.T) {
 		t.Fatal("unknown format accepted")
 	}
 }
+
+func TestQueryWith(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t, Options{MaxRows: 5, MaxChars: 60})
+	three := "SELECT i FROM range(3) r(i) ORDER BY i"
+
+	// Per-call rows cap below the host ceiling, still all-or-error by default.
+	res, err := db.QueryWith(ctx, three, QueryOptions{MaxRows: 3})
+	if err != nil || res.Text != "i\n0\n1\n2\n" || res.Rows != 3 || res.Truncated {
+		t.Fatalf("%#v %v", res, err)
+	}
+	if _, err := db.QueryWith(ctx, three, QueryOptions{MaxRows: 2}); !errors.Is(err, ErrResultLimit) {
+		t.Fatal(err)
+	}
+	// The host ceiling is a hard cap.
+	if _, err := db.QueryWith(ctx, three, QueryOptions{MaxRows: 6}); err == nil || errors.Is(err, ErrResultLimit) {
+		t.Fatal(err)
+	}
+	if _, err := db.QueryWith(ctx, three, QueryOptions{MaxRows: -1}); err == nil {
+		t.Fatal("negative accepted")
+	}
+
+	// Truncate keeps the first rows and says so.
+	res, err = db.QueryWith(ctx, three, QueryOptions{MaxRows: 2, Truncate: true})
+	if err != nil || res.Text != "i\n0\n1\n" || res.Rows != 2 || !res.Truncated {
+		t.Fatalf("%#v %v", res, err)
+	}
+	res, err = db.QueryWith(ctx, three, QueryOptions{Truncate: true, Format: Markdown})
+	if err != nil || res.Text != "| i |\n| --- |\n| 0 |\n| 1 |\n| 2 |\n" || res.Rows != 3 || res.Truncated {
+		t.Fatalf("%#v %v", res, err)
+	}
+	// Truncate also stops at a row boundary before the character limit.
+	res, err = db.QueryWith(ctx, "SELECT repeat('x', 20) AS s FROM range(4)", QueryOptions{Truncate: true})
+	if err != nil || res.Text != "s\n"+strings.Repeat("x", 20)+"\n"+strings.Repeat("x", 20)+"\n" || res.Rows != 2 || !res.Truncated {
+		t.Fatalf("%#v %v", res, err)
+	}
+	// An oversized header is still an error.
+	if _, err := db.QueryWith(ctx, "SELECT 1 AS "+identifier(strings.Repeat("h", 70)), QueryOptions{Truncate: true}); !errors.Is(err, ErrResultLimit) {
+		t.Fatal(err)
+	}
+
+	// JSON formats truncate by rows, keep order, and still error on characters.
+	res, err = db.QueryWith(ctx, three, QueryOptions{MaxRows: 2, Truncate: true, Format: JSONRows})
+	if err != nil || res.Text != `[{"i":0},{"i":1}]` || res.Rows != 2 || !res.Truncated {
+		t.Fatalf("%#v %v", res, err)
+	}
+	res, err = db.QueryWith(ctx, three, QueryOptions{MaxRows: 2, Truncate: true, Format: JSONColumnar})
+	if err != nil || res.Text != `{"i":[0,1]}` || res.Rows != 2 || !res.Truncated {
+		t.Fatalf("%#v %v", res, err)
+	}
+	res, err = db.QueryWith(ctx, three, QueryOptions{Format: JSONRows})
+	if err != nil || res.Rows != 3 || res.Truncated {
+		t.Fatalf("%#v %v", res, err)
+	}
+	if _, err := db.QueryWith(ctx, "SELECT repeat('x', 70) AS s", QueryOptions{Truncate: true, Format: JSONRows}); !errors.Is(err, ErrResultLimit) {
+		t.Fatal(err)
+	}
+}

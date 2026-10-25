@@ -114,6 +114,16 @@ MaxChars counts UTF-8 bytes, including headers and escaping. Results exceeding
 either limit return `ErrResultLimit` with no partial output. Add a SQL `LIMIT`
 or select fewer columns. Trailing semicolons are ignored.
 
+`QueryWith(ctx, sql, ntduckbox.QueryOptions{...})` adjusts one call and returns
+a `Result` with the text, the number of data rows, and a `Truncated` flag.
+`MaxRows` lowers the row cap for that call; the host limit from Open stays the
+ceiling and a larger value is an error. `Truncate` returns the rows that fit
+instead of `ErrResultLimit` and sets `Truncated`, so a host can tell its caller
+that more rows exist. CSV and Markdown stop at the last whole row within both
+limits; JSON formats stop at `MaxRows` rows, but a JSON result over `MaxChars`
+is still an error. Every query asks the engine for at most one row past the cap,
+so oversized results are not materialized.
+
 An empty Path or `:memory:` creates an empty in-memory database. DuckDB does not
 support opening an in-memory database with `access_mode=read_only`; internally
 this uses read-write mode, but every public query runs in a read-only transaction

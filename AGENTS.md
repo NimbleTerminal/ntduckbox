@@ -26,8 +26,10 @@ Read README.md for the public contract and threat model.
 - Keep transaction rollback and bad-connection disposal on every exit path.
   In-memory databases require internal read-write mode, so their read-only
   transaction enforcement is part of the security boundary.
-- `format.go` owns bounded, all-or-error CSV/Markdown output. Limits include
-  headers and escaping. They do not bound engine allocations or intermediate data.
+- `format.go` owns bounded CSV/Markdown output: all-or-error by default, or
+  truncated at a whole row only when the caller opts in through `QueryOptions`
+  and the `Result` reports it. Per-call limits never exceed the host limits
+  from Open. Limits include headers and escaping. They do not bound engine allocations or intermediate data.
   Query values are cast to VARCHAR by DuckDB; keep its text rendering rather than
   reformatting typed values in Go. JSON formats likewise serialize in DuckDB with
   `to_json`, as one cell plus a row count; do not re-encode typed values in Go.
