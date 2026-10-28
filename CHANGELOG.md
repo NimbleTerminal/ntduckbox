@@ -1,7 +1,8 @@
 # CHANGELOG
 
-## Unreleased (2026-10-28)
+## v0.2.1 (2026-10-28)
 
+ * Update mcp-go to v1.4.0 and indirect Go dependencies, including Arrow v18.8.0, go-json v0.11.2, and compress v1.20.3.
  * Reject `MaxRows` above `math.MaxInt-1` during Open to prevent row-limit overflow in all four formats.
 
 ## v0.2.0 (2026-10-25)
