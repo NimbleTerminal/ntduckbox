@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,6 +25,32 @@ func openTest(tb testing.TB, opts Options) *DB {
 		}
 	})
 	return db
+}
+
+func TestMaxRowsOverflow(t *testing.T) {
+	db, err := Open(Options{MaxRows: math.MaxInt})
+	if db != nil {
+		db.Close()
+		t.Fatal("Open returned a DB for an overflowing row limit")
+	}
+	if err == nil || !strings.Contains(err.Error(), "max rows must not exceed") {
+		t.Fatalf("expected row limit validation error, got %v", err)
+	}
+
+	db = openTest(t, Options{MaxRows: math.MaxInt - 1})
+	for _, format := range Formats {
+		t.Run(string(format), func(t *testing.T) {
+			for _, maxRows := range []int{0, math.MaxInt - 1} {
+				res, err := db.QueryWith(context.Background(), "SELECT 42 AS answer", QueryOptions{Format: format, MaxRows: maxRows})
+				if err != nil || res.Rows != 1 || res.Truncated || !strings.Contains(res.Text, "42") {
+					t.Fatalf("MaxRows=%d: result=%+v, error=%v", maxRows, res, err)
+				}
+			}
+			if _, err := db.QueryWith(context.Background(), "SELECT 42", QueryOptions{Format: format, MaxRows: math.MaxInt}); err == nil {
+				t.Fatal("QueryWith accepted a row limit above the host limit")
+			}
+		})
+	}
 }
 
 func TestQueryAndLimits(t *testing.T) {

@@ -89,7 +89,8 @@ The caller owns the DB and must close it. Calls may run concurrently; each DB
 serializes queries through one connection, and waiting counts toward the timeout.
 Pass a context to cancel a request earlier than the host-configured deadline.
 
-Zero limits select the defaults shown above; negatives are errors. CSV is the
+Zero limits select the defaults shown above; negatives are errors. `MaxRows`
+must not exceed `math.MaxInt-1`, leaving room to fetch one extra row. CSV is the
 default format. `QueryFormat(ctx, sql, ntduckbox.Markdown)` selects a format for
 one call: `CSV`, `Markdown`, `JSONRows`, or `JSONColumnar` (see `Formats`). `Describe(ctx, sql)` returns a query schema;
 `DescribeTable(ctx, "main", "events")` quotes each identifier component safely.

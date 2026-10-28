@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -24,7 +25,7 @@ import (
 type Options struct {
 	Path         string        // Existing database file; empty or :memory: creates an empty memory database.
 	AllowedDirs  []string      // Explicit opt-in to local file reads, including all descendants.
-	MaxRows      int           // Default 1000.
+	MaxRows      int           // Default 1000; must not exceed math.MaxInt-1.
 	MaxChars     int           // Default 100000; measured in UTF-8 bytes (a stricter bound than characters).
 	QueryTimeout time.Duration // Default 10 seconds; includes waiting for a connection.
 	Format       Format        // Default CSV.
@@ -45,6 +46,10 @@ type DB struct {
 func Open(opts Options) (*DB, error) {
 	if opts.MaxRows < 0 || opts.MaxChars < 0 || opts.QueryTimeout < 0 {
 		return nil, errors.New("limits must not be negative")
+	}
+	// Queries fetch one extra row to detect results exceeding the cap.
+	if opts.MaxRows > math.MaxInt-1 {
+		return nil, fmt.Errorf("max rows must not exceed %d", math.MaxInt-1)
 	}
 	if opts.MaxRows == 0 {
 		opts.MaxRows = 1000

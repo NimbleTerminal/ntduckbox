@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## Unreleased (2026-10-28)
+
+ * Reject `MaxRows` above `math.MaxInt-1` during Open to prevent row-limit overflow in all four formats.
+
 ## v0.2.0 (2026-10-25)
 
 Breaking: the module path changed from the v0.1.0 name to `nimbleterminal.dev/ntduckbox`; update imports and `go.mod`.
