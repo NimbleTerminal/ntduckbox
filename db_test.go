@@ -424,6 +424,450 @@ func TestSetParquetViewsRejectsFileBacked(t *testing.T) {
 	}
 }
 
+func TestAttachAndIsolation(t *testing.T) {
+	ctx := context.Background()
+	baseDir := t.TempDir()
+	basePath := filepath.Join(baseDir, "dank.duckdb")
+	secretCSV := filepath.Join(baseDir, "secret.csv")
+	otherDB := filepath.Join(baseDir, "other.duckdb")
+	if err := os.WriteFile(secretCSV, []byte("secret\n99\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := sql.Open("duckdb", basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Exec(`
+		CREATE TABLE ct_brands AS SELECT 'C0000000001' AS registration_number, 'Blue Dream' AS brand_name;
+		CREATE VIEW brand_names AS SELECT brand_name FROM ct_brands;
+		CREATE SEQUENCE reg_seq;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	otherSeed, err := sql.Open("duckdb", otherDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := otherSeed.Exec("CREATE TABLE hidden AS SELECT 1 AS x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := otherSeed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attach basePath without adding baseDir to AllowedDirs.
+	db := openTest(t, Options{
+		Attach: []Attachment{{Alias: "ct", Path: basePath}},
+	})
+	for _, q := range []string{
+		"SELECT registration_number, brand_name FROM ct_brands",
+		"SELECT registration_number, brand_name FROM ct.ct_brands",
+		"SELECT registration_number, brand_name FROM ct.main.ct_brands",
+	} {
+		if got, err := db.Query(ctx, q); err != nil || got != "registration_number,brand_name\nC0000000001,Blue Dream\n" {
+			t.Fatalf("%s: %q %v", q, got, err)
+		}
+	}
+	for _, parts := range [][]string{{"ct_brands"}, {"ct", "ct_brands"}, {"ct", "main", "ct_brands"}} {
+		if got, err := db.DescribeTable(ctx, parts...); err != nil || !strings.Contains(got, "registration_number") {
+			t.Fatalf("DescribeTable(%v): %q %v", parts, got, err)
+		}
+	}
+	if got, err := db.ListTables(ctx); err != nil || !strings.Contains(got, "ct,main,ct_brands") {
+		t.Fatalf("ListTables: %q %v", got, err)
+	}
+	if got, err := db.ListViews(ctx); err != nil || !strings.Contains(got, "ct,main,brand_names") {
+		t.Fatalf("ListViews: %q %v", got, err)
+	}
+
+	// Attached databases are strictly read-only at both the public API and raw engine levels.
+	if _, err := db.Query(ctx, "SELECT nextval('ct.reg_seq')"); err == nil {
+		t.Fatal("attached sequence write succeeded")
+	}
+	for _, stmt := range []string{
+		"INSERT INTO ct.ct_brands VALUES ('C2', 'Bad')",
+		"DELETE FROM ct.ct_brands",
+		"CREATE TABLE ct.bad(x INT)",
+		"DROP TABLE ct.ct_brands",
+	} {
+		_, err := db.pool.Exec(stmt)
+		assertEngineError(t, err, engineErrorInvalidInput, "read-only mode")
+	}
+	for _, stmt := range []string{"SET search_path = 'memory'", "DETACH ct"} {
+		if _, err := db.Query(ctx, stmt); err == nil || !strings.HasPrefix(err.Error(), "query rejected: ") {
+			t.Fatalf("expected %s rejection, got %v", stmt, err)
+		}
+	}
+
+	// Disposing of the pooled connection (as rollback does on failure) must
+	// restore search_path on the replacement connection.
+	conn, err := db.pool.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.rollback(conn)
+	_ = conn.Close()
+	if got, err := db.Query(ctx, "SELECT registration_number FROM ct_brands"); err != nil || got != "registration_number\nC0000000001\n" {
+		t.Fatalf("unqualified query after bad-connection recovery: %q %v", got, err)
+	}
+
+	// Untrusted SQL cannot reach sibling files in baseDir that were not attached or allowlisted.
+	for _, q := range []string{
+		"SELECT * FROM read_csv(" + literal(secretCSV) + ")",
+		"SELECT * FROM read_text(" + literal(secretCSV) + ")",
+		"SELECT * FROM glob(" + literal(filepath.Join(baseDir, "*")) + ")",
+	} {
+		_, err := db.Query(ctx, q)
+		assertEngineError(t, err, engineErrorPermission, "Cannot access")
+		_, err = db.pool.Exec(q)
+		assertEngineError(t, err, engineErrorPermission, "Cannot access")
+	}
+	if _, err := db.Query(ctx, "ATTACH "+literal(otherDB)+" AS other (READ_ONLY)"); err == nil || !strings.HasPrefix(err.Error(), "query rejected: ") {
+		t.Fatalf("expected ATTACH rejection, got %v", err)
+	}
+	_, err = db.pool.Exec("ATTACH " + literal(otherDB) + " AS other (READ_ONLY)")
+	assertEngineError(t, err, engineErrorPermission, "disabled")
+
+	// Validate Attachment options at Open.
+	for name, att := range map[string][]Attachment{
+		"empty_alias":     {{Alias: "", Path: basePath}},
+		"reserved_memory": {{Alias: "memory", Path: basePath}},
+		"reserved_temp":   {{Alias: "TEMP", Path: basePath}},
+		"reserved_system": {{Alias: "system", Path: basePath}},
+		"reserved_main":   {{Alias: "main", Path: basePath}},
+		"duplicate_alias": {{Alias: "ct", Path: basePath}, {Alias: "CT", Path: otherDB}},
+		"empty_path":      {{Alias: "ct", Path: ""}},
+		"memory_path":     {{Alias: "ct", Path: ":memory:"}},
+		"missing_path":    {{Alias: "ct", Path: filepath.Join(baseDir, "missing.duckdb")}},
+		"dir_path":        {{Alias: "ct", Path: baseDir}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad, err := Open(Options{Attach: att})
+			if bad != nil {
+				bad.Close()
+				t.Fatal("Open succeeded for invalid attachment")
+			}
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestSetCSVViews(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	csvA := filepath.Join(dir, "inv_a.csv")
+	csvB := filepath.Join(dir, "inv_b.csv")
+	headerOnly := filepath.Join(dir, "header_only.csv")
+	emptyCSV := filepath.Join(dir, "empty.csv")
+	badHeader := filepath.Join(dir, "bad_header.csv")
+	reorderedHeader := filepath.Join(dir, "reordered_header.csv")
+	outside := filepath.Join(t.TempDir(), "outside.csv")
+	for path, body := range map[string]string{
+		csvA:            "item_id,price,in_stock\nabc,31.5,true\n",
+		csvB:            "item_id,price,in_stock\ndef,45.0,false\n",
+		headerOnly:      "item_id,price,in_stock\n",
+		emptyCSV:        "",
+		badHeader:       "wrong,price,in_stock\nabc,31.5,true\n",
+		reorderedHeader: "price,item_id,in_stock\n31.5,abc,true\n",
+		outside:         "item_id,price,in_stock\nsecret,99.0,true\n",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cols := []CSVColumn{
+		{Name: "item_id", Type: "VARCHAR"},
+		{Name: "price", Type: "DOUBLE"},
+		{Name: "in_stock", Type: "BOOLEAN"},
+	}
+	db := openTest(t, Options{AllowedDirs: []string{dir}})
+
+	if err := db.SetCSVViews(ctx, map[string]CSVView{
+		"inventory": {Path: csvA, Columns: cols},
+		"raw_csv":   {Path: csvA},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Pinned types are preserved in JSONRows (number and boolean, not strings).
+	if got, err := db.QueryFormat(ctx, "SELECT item_id, price, in_stock FROM inventory", JSONRows); err != nil || got != `[{"item_id":"abc","price":31.5,"in_stock":true}]` {
+		t.Fatalf("inventory JSON: %q %v", got, err)
+	}
+	if got, err := db.Query(ctx, "SELECT item_id FROM raw_csv"); err != nil || got != "item_id\nabc\n" {
+		t.Fatalf("raw_csv: %q %v", got, err)
+	}
+
+	// Reloading swaps the CSV view and drops omitted CSV views.
+	if err := db.SetCSVViews(ctx, map[string]CSVView{
+		"inventory": {Path: csvB, Columns: cols},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.QueryFormat(ctx, "SELECT item_id, price, in_stock FROM inventory", JSONRows); err != nil || got != `[{"item_id":"def","price":45.0,"in_stock":false}]` {
+		t.Fatalf("reloaded inventory: %q %v", got, err)
+	}
+	if _, err := db.Query(ctx, "SELECT * FROM raw_csv"); err == nil {
+		t.Fatal("omitted CSV view still queryable")
+	}
+
+	// Denied path, traversal, symlink, header mismatch, empty file, or invalid column type fails and rolls back.
+	traversal := dir + string(os.PathSeparator) + ".." + string(os.PathSeparator) + filepath.Base(filepath.Dir(outside)) + string(os.PathSeparator) + "outside.csv"
+	for _, denied := range []string{outside, traversal} {
+		err := db.SetCSVViews(ctx, map[string]CSVView{
+			"inventory": {Path: denied, Columns: cols},
+		})
+		assertEngineError(t, err, engineErrorPermission, "Cannot access")
+	}
+	link := filepath.Join(dir, "link.csv")
+	if err := os.Symlink(outside, link); err == nil {
+		err = db.SetCSVViews(ctx, map[string]CSVView{
+			"inventory": {Path: link, Columns: cols},
+		})
+		assertEngineError(t, err, engineErrorPermission, "Cannot access")
+	}
+	for _, badCSV := range []string{badHeader, reorderedHeader, emptyCSV} {
+		if err := db.SetCSVViews(ctx, map[string]CSVView{
+			"inventory": {Path: badCSV, Columns: cols},
+		}); err == nil || !strings.Contains(err.Error(), "csv header mismatch") {
+			t.Fatalf("%s: expected header mismatch error, got %v", badCSV, err)
+		}
+	}
+	if err := db.SetCSVViews(ctx, map[string]CSVView{
+		"inventory": {Path: csvA, Columns: []CSVColumn{{Name: "item_id", Type: "NOT_A_TYPE"}, {Name: "price", Type: "DOUBLE"}, {Name: "in_stock", Type: "BOOLEAN"}}},
+	}); err == nil {
+		t.Fatal("invalid column type accepted")
+	}
+	// Previous inventory view remains intact after every failed update.
+	if got, err := db.Query(ctx, "SELECT item_id FROM inventory"); err != nil || got != "item_id\ndef\n" {
+		t.Fatalf("rollback failed: %q %v", got, err)
+	}
+	// A header-only CSV with matching column names succeeds and returns 0 rows.
+	if err := db.SetCSVViews(ctx, map[string]CSVView{
+		"inventory": {Path: headerOnly, Columns: cols},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.QueryFormat(ctx, "SELECT * FROM inventory", JSONRows); err != nil || got != "[]" {
+		t.Fatalf("header-only inventory: %q %v", got, err)
+	}
+
+	// Validation errors for malformed inputs.
+	for _, bad := range []map[string]CSVView{
+		{"": {Path: csvA}},
+		{"v": {Path: ""}},
+		{"v": {Path: csvA, Columns: []CSVColumn{{Name: "", Type: "VARCHAR"}}}},
+		{"v": {Path: csvA, Columns: []CSVColumn{{Name: "a", Type: " "}}}},
+		{"v": {Path: csvA, Columns: []CSVColumn{{Name: "a", Type: "VARCHAR"}, {Name: "a", Type: "VARCHAR"}}}},
+	} {
+		if err := db.SetCSVViews(ctx, bad); err == nil {
+			t.Fatalf("invalid CSVView accepted: %+v", bad)
+		}
+	}
+}
+
+func TestSetViewsAndDankBotWorkflow(t *testing.T) {
+	ctx := context.Background()
+	baseDir := t.TempDir()
+	csvDir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	basePath := filepath.Join(baseDir, "dank-mcp.duckdb")
+	seed, err := sql.Open("duckdb", basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Exec(`
+		CREATE TABLE ct_brands AS
+		SELECT 'RN-100' AS registration_number, 'Blue Dream C0000000001' AS brand_name,
+		       'Acme Growers' AS producer, 'C0000000001' AS national_drug_code, 22.4 AS reg_thc
+		UNION ALL
+		SELECT 'RN-200', 'Northern Lights C0000000002', 'North Farms', 'C0000000002', 19.1;
+		CREATE SEQUENCE base_seq;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	inv1 := filepath.Join(csvDir, "inv1.csv")
+	inv2 := filepath.Join(csvDir, "inv2.csv")
+	outsideCSV := filepath.Join(outsideDir, "secret.csv")
+	for path, body := range map[string]string{
+		inv1:       "item_id,product_name,brand,price,in_stock\ni1,Blue Dream 3.5g C0000000001,Acme,31.5,true\n",
+		inv2:       "item_id,product_name,brand,price,in_stock\ni2,Northern Lights C0000000002,North,40.0,false\n",
+		outsideCSV: "item_id,product_name,brand,price,in_stock\nx,Secret,Bad,0.0,false\n",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cols := []CSVColumn{
+		{Name: "item_id", Type: "VARCHAR"},
+		{Name: "product_name", Type: "VARCHAR"},
+		{Name: "brand", Type: "VARCHAR"},
+		{Name: "price", Type: "DOUBLE"},
+		{Name: "in_stock", Type: "BOOLEAN"},
+	}
+	inventoryBrandsSQL := `
+		-- Reconcile inventory against ct_brands in the attached read-only database.
+		WITH inv AS (
+			SELECT *, regexp_extract(product_name, 'C[0-9]{10}', 0) AS ndc
+			FROM inventory
+		)
+		SELECT inv.item_id, inv.price, inv.in_stock,
+		       b.registration_number, b.producer, b.reg_thc
+		FROM inv
+		LEFT JOIN ct_brands b ON b.national_drug_code = inv.ndc;
+	`
+
+	db := openTest(t, Options{
+		Attach:      []Attachment{{Alias: "ct", Path: basePath}},
+		AllowedDirs: []string{csvDir},
+	})
+	if err := db.SetCSVViews(ctx, map[string]CSVView{
+		"inventory": {Path: inv1, Columns: cols},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetViews(ctx, map[string]string{
+		"inventory_brands": inventoryBrandsSQL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.Query(ctx, "SELECT item_id, registration_number, producer, price FROM inventory_brands"); err != nil || got != "item_id,registration_number,producer,price\ni1,RN-100,Acme Growers,31.5\n" {
+		t.Fatalf("inventory_brands initial: %q %v", got, err)
+	}
+
+	// R4: Reloading the CSV view in place updates inventory_brands without
+	// reopening the base database or re-running SetViews.
+	if err := db.SetCSVViews(ctx, map[string]CSVView{
+		"inventory": {Path: inv2, Columns: cols},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.Query(ctx, "SELECT item_id, registration_number, producer, price FROM inventory_brands"); err != nil || got != "item_id,registration_number,producer,price\ni2,RN-200,North Farms,40.0\n" {
+		t.Fatalf("inventory_brands after CSV swap: %q %v", got, err)
+	}
+
+	// Cross-set name collisions are rejected before touching existing views.
+	if err := db.SetViews(ctx, map[string]string{"inventory": "SELECT 1"}); err == nil {
+		t.Fatal("SetViews overwrote a CSVView")
+	}
+	if err := db.SetCSVViews(ctx, map[string]CSVView{"inventory_brands": {Path: inv1}}); err == nil {
+		t.Fatal("SetCSVViews overwrote a SQL view")
+	}
+	if err := db.SetParquetViews(ctx, map[string]string{"inventory": filepath.Join(csvDir, "x.parquet")}); err == nil {
+		t.Fatal("SetParquetViews overwrote a CSVView")
+	}
+
+	// Unsafe view bodies are rejected at preparation or bind time and roll back.
+	if _, err := db.pool.Exec("CREATE TABLE canary AS SELECT 42 AS n"); err != nil {
+		t.Fatal(err)
+	}
+	for _, badSQL := range []string{
+		"",
+		"   ; ; ",
+		"CREATE TABLE bad(x INT)",
+		"DELETE FROM canary",
+		"COPY (SELECT 1) TO " + literal(filepath.Join(csvDir, "out.csv")),
+		"SET enable_external_access = true",
+		"LOAD httpfs",
+		"ATTACH ':memory:' AS bad",
+		"SELECT 1; DELETE FROM canary",
+		"SELECT 1); DELETE FROM canary; SELECT * FROM (SELECT 2",
+		"SELECT * FROM query('DELETE FROM canary')",
+	} {
+		if err := db.SetViews(ctx, map[string]string{"inventory_brands": badSQL}); err == nil {
+			t.Fatalf("unsafe view SQL accepted: %q", badSQL)
+		}
+	}
+	err = db.SetViews(ctx, map[string]string{
+		"inventory_brands": "SELECT * FROM read_csv(" + literal(outsideCSV) + ")",
+	})
+	assertEngineError(t, err, engineErrorPermission, "Cannot access")
+
+	// Untrusted SQL cannot drop, replace, or bypass the host-defined views.
+	for _, q := range []string{
+		"DROP VIEW inventory",
+		"DROP VIEW inventory_brands",
+		"CREATE OR REPLACE VIEW inventory_brands AS SELECT 1 AS x",
+	} {
+		if _, err := db.Query(ctx, q); err == nil || !strings.HasPrefix(err.Error(), "query rejected: ") {
+			t.Fatalf("untrusted DDL not rejected at preparation: %s -> %v", q, err)
+		}
+	}
+	var locked, external bool
+	if err := db.pool.QueryRow("SELECT current_setting('lock_configuration'), current_setting('enable_external_access')").Scan(&locked, &external); err != nil {
+		t.Fatal(err)
+	}
+	if !locked || external {
+		t.Fatalf("engine security settings changed: lock_configuration=%v enable_external_access=%v", locked, external)
+	}
+
+	// Canary and previous inventory_brands view remain untouched after rejected calls.
+	if got, err := db.Query(ctx, "SELECT n FROM canary"); err != nil || got != "n\n42\n" {
+		t.Fatalf("canary mutated: %q %v", got, err)
+	}
+	if got, err := db.Query(ctx, "SELECT item_id, registration_number FROM inventory_brands"); err != nil || got != "item_id,registration_number\ni2,RN-200\n" {
+		t.Fatalf("inventory_brands damaged after rollback: %q %v", got, err)
+	}
+
+	// Even if a view body calls nextval on an in-memory sequence, querying the
+	// view runs inside BEGIN TRANSACTION READ ONLY and is rejected.
+	if _, err := db.pool.Exec("CREATE SEQUENCE mem_seq"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetViews(ctx, map[string]string{"seq_view": "SELECT nextval('mem_seq') AS n"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Query(ctx, "SELECT * FROM seq_view"); err == nil {
+		t.Fatal("mutating sequence view succeeded in read-only query transaction")
+	}
+
+	// Clearing views removes them cleanly.
+	if err := db.SetViews(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetCSVViews(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.ListViews(ctx); err != nil || got != "table_catalog,table_schema,table_name\n" {
+		t.Fatalf("expected no views after clearing, got %q %v", got, err)
+	}
+}
+
+func TestSetCSVAndSQLViewsRejectFileBacked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db.duckdb")
+	csvPath := filepath.Join(dir, "a.csv")
+	if err := os.WriteFile(csvPath, []byte("x\n1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := sql.Open("duckdb", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Exec("CREATE TABLE t AS SELECT 1 AS n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db := openTest(t, Options{Path: path, AllowedDirs: []string{dir}})
+	if err := db.SetCSVViews(context.Background(), map[string]CSVView{"v": {Path: csvPath}}); err == nil {
+		t.Fatal("SetCSVViews succeeded on file-backed database")
+	}
+	if err := db.SetViews(context.Background(), map[string]string{"v": "SELECT 1"}); err == nil {
+		t.Fatal("SetViews succeeded on file-backed database")
+	}
+}
+
 func TestJSONRows(t *testing.T) {
 	ctx := context.Background()
 	db := openTest(t, Options{Format: JSONRows})

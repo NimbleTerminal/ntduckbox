@@ -219,23 +219,60 @@ csv, err := db.Query(ctx,
 
 CSV and Parquet support bundled into DuckDB works without loading extensions.
 
-Hosts can name Parquet files or globs as views in an in-memory database, and
-replace that set at runtime as files appear or disappear, without any SQL:
+Hosts can name Parquet or CSV files (or globs) as views in an in-memory
+database, and replace either set at runtime as files appear or disappear,
+without any SQL:
 
 ```go
 err = db.SetParquetViews(ctx, map[string]string{
     "XNAS.ITCH/ohlcv-1s": "/srv/analytics/cache/XNAS.ITCH/ohlcv-1s/*.parquet",
 })
 csv, err = db.Query(ctx, `SELECT * FROM "XNAS.ITCH/ohlcv-1s" LIMIT 50`)
+
+err = db.SetCSVViews(ctx, map[string]ntduckbox.CSVView{
+    "inventory": {
+        Path: "/srv/analytics/cache/inventory.csv",
+        Columns: []ntduckbox.CSVColumn{
+            {Name: "item_id", Type: "VARCHAR"},
+            {Name: "price", Type: "DOUBLE"},
+            {Name: "in_stock", Type: "BOOLEAN"},
+        },
+    },
+})
 ```
 
-Each call replaces the whole set: views from earlier calls that are missing from
-the map are dropped, and an empty map drops them all. ntduckbox quotes names and
-paths itself; the host never supplies SQL. The engine binds each view when it is
-created, under the locked settings, so a path outside `AllowedDirs` fails the
-call and the previous set stays in place. File-backed databases are opened
-read-only and reject the call. For views in a persistent database, create them
-in a trusted preparation step, close that writer, then open with ntduckbox.
+When `CSVView.Columns` is provided, `SetCSVViews` checks that the file header
+matches those column names in order before pinning each column's DuckDB type in
+`read_csv`.
+
+To join runtime views in `main` against an existing read-only `.duckdb` file,
+attach the file at `Open` with `Options.Attach` and define host-trusted `SELECT`
+views with `SetViews`:
+
+```go
+db, err := ntduckbox.Open(ntduckbox.Options{
+    Attach:      []ntduckbox.Attachment{{Alias: "ct", Path: "/srv/analytics/brands.duckdb"}},
+    AllowedDirs: []string{"/srv/analytics/cache"},
+})
+// Attached catalogs are always read-only; their main schemas are added to
+// search_path after memory.main, so both ct.ct_brands and ct_brands resolve.
+err = db.SetViews(ctx, map[string]string{
+    "inventory_brands": `SELECT i.item_id, b.brand_name FROM inventory i LEFT JOIN ct_brands b USING (item_id)`,
+})
+```
+
+Each `SetParquetViews`, `SetCSVViews`, or `SetViews` call replaces its own
+managed set: views from earlier calls to the same method that are missing from
+the map are dropped, an empty map drops them all, and views managed by the other
+methods are untouched. `SetParquetViews` and `SetCSVViews` quote names, paths,
+and column definitions themselves; `SetViews` wraps each query body as a
+subquery and validates it with DuckDB's single-statement `Prepare` API
+(`STATEMENT_TYPE_SELECT`) before creating the view. The engine binds every view
+under the locked settings, so a path outside `AllowedDirs`, a header mismatch,
+or a non-SELECT statement fails the call and leaves the previous set in place.
+File-backed primary databases are opened read-only and reject all three methods.
+See [docs/host-views.md](docs/host-views.md) for the design and threat-model
+analysis.
 
 ## Security considerations
 
@@ -248,7 +285,9 @@ instances in-process. Conflicting configuration causes Open to fail closed.
 
 Before returning a DB, Open configures:
 
-- File-backed `access_mode=read_only`.
+- File-backed `access_mode=read_only`, and `READ_ONLY` attachments for every
+  `Options.Attach` entry (with `search_path` set to `main` followed by each
+  attached catalog's `main` schema).
 - Extension autoloading, autoinstallation, unsigned extensions, and community
   extensions disabled at engine creation.
 - Explicit `allowed_directories`, empty `allowed_paths` and `allowed_configs`.
@@ -257,10 +296,10 @@ Before returning a DB, Open configures:
 - `lock_configuration=true`, after all other settings are applied.
 
 There is no user SQL during initialization. Every setting must succeed. DuckDB
-requires the allowlist to be configured before disabling external access.
-`SetParquetViews` is the only host-side catalog change; it takes names and
-paths, not SQL, runs after the lock, and cannot touch settings or file-backed
-databases.
+requires attachments and the allowlist to be configured before disabling external
+access. `SetParquetViews`, `SetCSVViews`, and `SetViews` are the only host-side
+catalog changes; they run after the lock on in-memory databases only, cannot
+touch settings or file-backed databases, and are never exposed through MCP.
 
 Public queries are wrapped as SELECT subqueries whose columns are cast to VARCHAR,
 then checked with DuckDB's native single-statement preparation API before execution. This is deliberately not a
@@ -299,7 +338,8 @@ else, no network, and CPU and memory limits. Keep DuckDB patched. See
 The root module is the library. `db.go` handles lockdown and queries, `format.go`
 encodes bounded results, and `mcp.go` registers the tools. `cmd/ntduckbox` contains
 the STDIO server in the same module. `docs/` holds longer guides such as the
-[Haybarn guide](docs/haybarn.md). `scripts/package.sh` builds release archives;
+[Haybarn guide](docs/haybarn.md) and
+[host-defined views design](docs/host-views.md). `scripts/package.sh` builds release archives;
 `.github/workflows/ci.yml` runs checks and publishes tagged releases.
 
 ## Validation

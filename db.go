@@ -17,13 +17,33 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// Attachment names an existing DuckDB file to attach read-only at Open.
+type Attachment struct {
+	Path  string // Existing database file.
+	Alias string // Catalog name in SQL; must not be empty or reserved.
+}
+
+// CSVColumn is one column of a CSVView in file order.
+type CSVColumn struct {
+	Name string // Column name in the CSV header.
+	Type string // DuckDB column type, for example "VARCHAR" or "DOUBLE".
+}
+
+// CSVView configures a CSV-backed view for SetCSVViews.
+type CSVView struct {
+	Path    string      // CSV file path or glob inside AllowedDirs.
+	Columns []CSVColumn // Optional ordered column names and types; validated against the header and pinned in read_csv.
+}
 
 // Options configures a DB. Zero values select conservative defaults. There is
 // deliberately no write-access option or exposed underlying SQL connection.
 type Options struct {
 	Path         string        // Existing database file; empty or :memory: creates an empty memory database.
+	Attach       []Attachment  // Existing database files attached read-only before lockdown; their main schemas are added to search_path.
 	AllowedDirs  []string      // Explicit opt-in to local file reads, including all descendants.
 	MaxRows      int           // Default 1000; must not exceed math.MaxInt-1.
 	MaxChars     int           // Default 100000; measured in UTF-8 bytes (a stricter bound than characters).
@@ -31,14 +51,24 @@ type Options struct {
 	Format       Format        // Default CSV.
 }
 
+type viewKind uint8
+
+const (
+	viewParquet viewKind = iota + 1
+	viewCSV
+	viewSQL
+)
+
 // DB owns an isolated DuckDB connection pool with immutable security settings.
 type DB struct {
-	pool *sql.DB
-	opts Options
+	pool       *sql.DB
+	opts       Options
+	searchPath string
 
-	viewsMu sync.Mutex
-	views   map[string]struct{} // Names created by SetParquetViews.
-	memory  bool
+	viewsMu         sync.Mutex
+	views           map[string]viewKind // Names created by SetParquetViews, SetCSVViews, and SetViews.
+	resetSearchPath atomic.Bool
+	memory          bool
 }
 
 // Open opens an existing file read-only or creates an empty in-memory database.
@@ -95,6 +125,7 @@ func Open(opts Options) (*DB, error) {
 	}
 	path := opts.Path
 	memory := path == "" || path == ":memory:"
+	primaryCatalog := "memory"
 	if memory {
 		path = ":memory:"
 		config.Set("access_mode", "read_write")
@@ -108,6 +139,44 @@ func Open(opts Options) (*DB, error) {
 		if strings.ContainsAny(path, "?#") {
 			return nil, errors.New("database path must not contain '?' or '#'")
 		}
+		base := filepath.Base(path)
+		primaryCatalog = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	seenAliases := map[string]struct{}{
+		"memory": {}, "system": {}, "temp": {}, "main": {},
+		strings.ToLower(primaryCatalog): {},
+	}
+	attachments := make([]Attachment, 0, len(opts.Attach))
+	searchSchemas := []string{"main"}
+	for _, att := range opts.Attach {
+		if att.Alias == "" {
+			return nil, errors.New("attachment alias must not be empty")
+		}
+		key := strings.ToLower(att.Alias)
+		if _, exists := seenAliases[key]; exists {
+			return nil, fmt.Errorf("invalid or duplicate attachment alias: %s", att.Alias)
+		}
+		seenAliases[key] = struct{}{}
+		if att.Path == "" || att.Path == ":memory:" {
+			return nil, errors.New("attachment path must name an existing database file")
+		}
+		abs, err := filepath.Abs(att.Path)
+		if err != nil {
+			return nil, err
+		}
+		abs, err = filepath.EvalSymlinks(abs)
+		if err != nil {
+			return nil, fmt.Errorf("attachment path: %w", err)
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return nil, err
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("not a database file: %s", abs)
+		}
+		attachments = append(attachments, Attachment{Path: abs, Alias: att.Alias})
+		searchSchemas = append(searchSchemas, identifier(att.Alias)+".main")
 	}
 	connector, err := newEngineConnector(path + "?" + config.Encode())
 	if err != nil {
@@ -117,40 +186,154 @@ func Open(opts Options) (*DB, error) {
 	pool.SetMaxOpenConns(1)
 	pool.SetMaxIdleConns(1)
 	fail := func(err error) (*DB, error) { return nil, errors.Join(err, pool.Close()) }
-	for _, setting := range []string{
+	setup := make([]string, 0, len(attachments)+8)
+	for _, att := range attachments {
+		setup = append(setup, "ATTACH "+literal(att.Path)+" AS "+identifier(att.Alias)+" (READ_ONLY)")
+	}
+	var searchPath string
+	if len(attachments) > 0 {
+		searchPath = strings.Join(searchSchemas, ",")
+		setup = append(setup, "SET search_path = "+literal(searchPath))
+	}
+	setup = append(setup,
 		"SET temp_directory = ''",
-		"SET allowed_directories = [" + strings.Join(dirs, ",") + "]",
+		"SET allowed_directories = ["+strings.Join(dirs, ",")+"]",
 		"SET allowed_paths = []", "SET allowed_configs = []",
 		"SET disabled_filesystems = 'HTTPFileSystem,S3FileSystem'",
 		"SET enable_external_access = false", "SET lock_configuration = true",
-	} {
+	)
+	for _, setting := range setup {
 		if _, err := pool.ExecContext(context.Background(), setting); err != nil {
 			return fail(fmt.Errorf("lockdown: %w", err))
 		}
 	}
-	return &DB{pool: pool, opts: opts, memory: memory}, nil
+	return &DB{pool: pool, opts: opts, searchPath: searchPath, memory: memory}, nil
 }
 
-// SetParquetViews replaces the host-defined views of an in-memory database.
-// Keys are view names in the main schema; values are Parquet file paths or
-// globs inside AllowedDirs. Views from earlier calls that are absent from views
-// are dropped. The engine binds every view at creation, so a path outside
+// SetParquetViews replaces the host-defined Parquet views of an in-memory
+// database. Keys are view names in the main schema; values are Parquet file
+// paths or globs inside AllowedDirs. Parquet views from earlier calls that are
+// absent from views are dropped; views managed by SetCSVViews or SetViews are
+// untouched. The engine binds every view at creation, so a path outside
 // AllowedDirs fails the whole call and leaves the previous set in place.
 // File-backed databases are opened read-only and return an error.
 func (db *DB) SetParquetViews(ctx context.Context, views map[string]string) error {
-	if !db.memory {
-		return errors.New("views require an in-memory database")
-	}
 	for name, path := range views {
 		if name == "" || path == "" {
 			return errors.New("view names and paths must not be empty")
 		}
 	}
+	return db.replaceViews(ctx, viewParquet, slices.Sorted(maps.Keys(views)), func(_ context.Context, _ *sql.Conn, name string) (string, error) {
+		return "SELECT * FROM read_parquet(" + literal(views[name]) + ")", nil
+	})
+}
+
+// SetCSVViews replaces the host-defined CSV views of an in-memory database.
+// Keys are view names in the main schema; values specify a CSV file path or
+// glob inside AllowedDirs and an optional ordered slice of pinned columns. When
+// Columns is non-empty, SetCSVViews checks that the file header matches the
+// column names in order and pins each column's DuckDB type in read_csv. CSV
+// views from earlier calls that are absent from views are dropped; views
+// managed by SetParquetViews or SetViews are untouched. A path outside
+// AllowedDirs, a header mismatch, or an invalid column type fails the call and
+// leaves the previous set in place. File-backed databases return an error.
+func (db *DB) SetCSVViews(ctx context.Context, views map[string]CSVView) error {
+	for name, v := range views {
+		if name == "" || v.Path == "" {
+			return errors.New("view names and paths must not be empty")
+		}
+		seen := make(map[string]struct{}, len(v.Columns))
+		for _, col := range v.Columns {
+			if col.Name == "" || strings.TrimSpace(col.Type) == "" {
+				return errors.New("csv column names and types must not be empty")
+			}
+			if _, dup := seen[col.Name]; dup {
+				return fmt.Errorf("duplicate csv column %q in view %q", col.Name, name)
+			}
+			seen[col.Name] = struct{}{}
+		}
+	}
+	return db.replaceViews(ctx, viewCSV, slices.Sorted(maps.Keys(views)), func(ctx context.Context, conn *sql.Conn, name string) (string, error) {
+		v := views[name]
+		if len(v.Columns) == 0 {
+			return "SELECT * FROM read_csv(" + literal(v.Path) + ", header = true)", nil
+		}
+		if err := validateCSVHeader(ctx, conn, name, v); err != nil {
+			return "", err
+		}
+		cols := make([]string, len(v.Columns))
+		for i, col := range v.Columns {
+			cols[i] = literal(col.Name) + ": " + literal(col.Type)
+		}
+		return "SELECT * FROM read_csv(" + literal(v.Path) + ", header = true, columns = {" + strings.Join(cols, ", ") + "})", nil
+	})
+}
+
+func validateCSVHeader(ctx context.Context, conn *sql.Conn, name string, v CSVView) error {
+	rows, err := conn.QueryContext(ctx, "SELECT * FROM read_csv("+literal(v.Path)+", header = true, all_varchar = true) LIMIT 0")
+	if err != nil {
+		return err
+	}
+	cols, colErr := rows.Columns()
+	closeErr := rows.Close()
+	if err := errors.Join(colErr, closeErr); err != nil {
+		return err
+	}
+	want := make([]string, len(v.Columns))
+	for i, c := range v.Columns {
+		want[i] = c.Name
+	}
+	if !slices.Equal(cols, want) {
+		return fmt.Errorf("csv header mismatch for %s: got %v, want %v", name, cols, want)
+	}
+	return nil
+}
+
+// SetViews replaces the host-defined SQL views of an in-memory database. Keys
+// are view names in the main schema; values are single SELECT or WITH...SELECT
+// query bodies (without CREATE VIEW). Each body is wrapped as a subquery and
+// validated with DuckDB's single-statement Prepare API before execution, then
+// bound by the engine under the locked configuration. SQL views from earlier
+// calls that are absent from views are dropped; views managed by
+// SetParquetViews or SetCSVViews are untouched. Any non-SELECT statement,
+// batch, or disallowed file access fails the call and leaves the previous set
+// in place. File-backed databases return an error.
+func (db *DB) SetViews(ctx context.Context, views map[string]string) error {
+	cleaned := make(map[string]string, len(views))
+	for name, query := range views {
+		q := strings.TrimRight(strings.TrimSpace(query), "; \t\r\n")
+		if name == "" || q == "" {
+			return errors.New("view names and queries must not be empty")
+		}
+		cleaned[name] = q
+	}
+	return db.replaceViews(ctx, viewSQL, slices.Sorted(maps.Keys(cleaned)), func(_ context.Context, conn *sql.Conn, name string) (string, error) {
+		body := "SELECT * FROM (\n" + cleaned[name] + "\n) AS ntduckbox_view"
+		if err := validateSelect(conn, body); err != nil {
+			return "", fmt.Errorf("view %s rejected: %w", name, err)
+		}
+		return body, nil
+	})
+}
+
+func (db *DB) replaceViews(ctx context.Context, kind viewKind, names []string, build func(context.Context, *sql.Conn, string) (string, error)) error {
+	if !db.memory {
+		return errors.New("views require an in-memory database")
+	}
 	db.viewsMu.Lock()
 	defer db.viewsMu.Unlock()
+	for _, name := range names {
+		if existing, ok := db.views[name]; ok && existing != kind {
+			return fmt.Errorf("view %q is already managed by another view set", name)
+		}
+	}
+	keep := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		keep[name] = struct{}{}
+	}
 	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
 	defer cancel()
-	conn, err := db.pool.Conn(ctx)
+	conn, err := db.conn(ctx)
 	if err != nil {
 		return err
 	}
@@ -160,15 +343,22 @@ func (db *DB) SetParquetViews(ctx context.Context, views map[string]string) erro
 	}
 	apply := func() error {
 		for _, name := range slices.Sorted(maps.Keys(db.views)) {
-			if _, ok := views[name]; ok {
+			if db.views[name] != kind {
+				continue
+			}
+			if _, ok := keep[name]; ok {
 				continue
 			}
 			if _, err := conn.ExecContext(ctx, "DROP VIEW IF EXISTS main."+identifier(name)); err != nil {
 				return err
 			}
 		}
-		for _, name := range slices.Sorted(maps.Keys(views)) {
-			stmt := "CREATE OR REPLACE VIEW main." + identifier(name) + " AS SELECT * FROM read_parquet(" + literal(views[name]) + ")"
+		for _, name := range names {
+			selectSQL, err := build(ctx, conn, name)
+			if err != nil {
+				return err
+			}
+			stmt := "CREATE OR REPLACE VIEW main." + identifier(name) + " AS " + selectSQL
 			if _, err := conn.ExecContext(ctx, stmt); err != nil {
 				return err
 			}
@@ -177,17 +367,65 @@ func (db *DB) SetParquetViews(ctx context.Context, views map[string]string) erro
 		return err
 	}
 	if err := apply(); err != nil {
-		if _, rbErr := conn.ExecContext(context.Background(), "ROLLBACK"); rbErr != nil {
-			// Never return a connection with unknown transaction state to the pool.
-			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-		}
+		db.rollback(conn)
 		return fmt.Errorf("set views: %w", err)
 	}
-	db.views = make(map[string]struct{}, len(views))
-	for name := range views {
-		db.views[name] = struct{}{}
+	if db.views == nil {
+		db.views = make(map[string]viewKind, len(names))
+	}
+	for name, existing := range db.views {
+		if existing == kind {
+			delete(db.views, name)
+		}
+	}
+	for _, name := range names {
+		db.views[name] = kind
 	}
 	return nil
+}
+
+func (db *DB) conn(ctx context.Context) (*sql.Conn, error) {
+	conn, err := db.pool.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if db.searchPath != "" && db.resetSearchPath.Load() {
+		if _, err := conn.ExecContext(ctx, "SET search_path = "+literal(db.searchPath)); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		db.resetSearchPath.Store(false)
+	}
+	return conn, nil
+}
+
+func (db *DB) rollback(conn *sql.Conn) {
+	if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		// Never return a connection with unknown transaction state to the pool.
+		db.resetSearchPath.Store(true)
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
+}
+
+// validateSelect checks that query is a single SELECT statement using the
+// engine's native Prepare API. Conn.Prepare (unlike PrepareContext) extracts
+// one statement and rejects batches without executing their leading statements.
+func validateSelect(conn *sql.Conn, query string) error {
+	return conn.Raw(func(raw any) error {
+		stmt, err := raw.(*engineConn).Prepare(query)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		typ, err := stmt.(*engineStmt).StatementType()
+		if err != nil {
+			return err
+		}
+		if typ != engineSelect {
+			return errors.New("only SELECT queries are allowed")
+		}
+		return nil
+	})
 }
 
 func identifier(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
@@ -249,7 +487,7 @@ func (db *DB) run(ctx context.Context, query string, opts QueryOptions, describe
 	format := opts.Format
 	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
 	defer cancel()
-	conn, err := db.pool.Conn(ctx)
+	conn, err := db.conn(ctx)
 	if err != nil {
 		return Result{}, err
 	}
@@ -258,12 +496,7 @@ func (db *DB) run(ctx context.Context, query string, opts QueryOptions, describe
 	if _, err = conn.ExecContext(ctx, "BEGIN TRANSACTION READ ONLY"); err != nil {
 		return Result{}, err
 	}
-	defer func() {
-		if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
-			// Never return a connection with unknown transaction state to the pool.
-			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-		}
-	}()
+	defer db.rollback(conn)
 	query = strings.TrimRight(strings.TrimSpace(query), "; \t\r\n")
 	inner := "(\n" + query + "\n) AS ntduckbox_query"
 	// DuckDB casts every value to VARCHAR so results use its canonical text
@@ -283,25 +516,7 @@ func (db *DB) run(ctx context.Context, query string, opts QueryOptions, describe
 		}
 		wrapped = jsonQuery(source, format, opts.MaxRows)
 	}
-	// Conn.Prepare (unlike PrepareContext) extracts exactly one statement and
-	// rejects batches without executing their leading statements. Do not replace
-	// this with database/sql.PrepareContext: the driver executes batch prefixes.
-	err = conn.Raw(func(raw any) error {
-		stmt, err := raw.(*engineConn).Prepare(wrapped)
-		if err != nil {
-			return err
-		}
-		defer stmt.Close()
-		typ, err := stmt.(*engineStmt).StatementType()
-		if err != nil {
-			return err
-		}
-		if typ != engineSelect {
-			return errors.New("only SELECT queries are allowed")
-		}
-		return nil
-	})
-	if err != nil {
+	if err := validateSelect(conn, wrapped); err != nil {
 		return Result{}, fmt.Errorf("query rejected: %w", err)
 	}
 	if describe && !format.isJSON() {

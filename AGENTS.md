@@ -14,13 +14,16 @@ Read README.md for the public contract and threat model.
   same API; everything else must compile and pass tests under both engines
   (`GOFLAGS=-tags=haybarn task ci`). Both drivers stay pinned in go.mod.
 - `db.go` owns connection setup, query validation, and read-only transactions.
-  Security settings must all succeed before Open returns. Configure allowed
-  directories before disabling external access; lock configuration last.
+  Security settings must all succeed before Open returns. Attach read-only
+  databases and configure allowed directories before disabling external access;
+  lock configuration last.
 - Keep the underlying pool private. No write-access option, arbitrary startup
   SQL, runtime extension loading, or user-controlled configuration changes.
-  `SetParquetViews` is the one host-side catalog mutation: structured names and
-  paths only, in-memory databases only, transactional, and bound by the engine
-  under the locked settings. Do not extend it to accept SQL.
+  Host-side catalog mutations (`SetParquetViews`, `SetCSVViews`, `SetViews`)
+  run on in-memory databases only, transactionally, and bound by the engine
+  under the locked settings. Keep `SetParquetViews` and `SetCSVViews` to
+  structured names, paths, and column definitions (never SQL); `SetViews`
+  accepts only single-statement `SELECT` bodies validated with `Conn.Prepare`.
 - Preserve native single-statement validation. The driver's PrepareContext can
   execute batch prefixes; it is not a safe replacement for Conn.Prepare here.
 - Keep transaction rollback and bad-connection disposal on every exit path.
