@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## v0.2.2 (2026-11-07)
+
+ * Update mcp-go to v1.5.0 and indirect Go dependencies, including go-json v0.12.0, cpuid v2.4.2, and golang.org/x/exp.
+
 ## v0.2.1 (2026-10-28)
 
  * Update mcp-go to v1.4.0 and indirect Go dependencies, including Arrow v18.8.0, go-json v0.11.2, and compress v1.20.3.
