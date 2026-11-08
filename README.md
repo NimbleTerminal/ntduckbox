@@ -86,13 +86,21 @@ func run() error {
 ## Results and lifecycle
 
 The caller owns the DB and must close it. Calls may run concurrently; each DB
-uses a single pooled connection (`SetMaxOpenConns(1)`) so DuckDB catalog state
-and settings remain consistent, and `QueryTimeout` starts before acquiring that
-connection. Under heavy concurrency, later callers wait in `sql.DB`'s connection
-queue and can exhaust their `QueryTimeout` before their SQL runs; hosts that fan
-out many concurrent requests should enforce admission control (such as a bounded
-semaphore) in front of `QueryWith` if they prefer fast rejection over queueing.
-Pass a context to cancel a request earlier than the host-configured deadline.
+uses a single pooled connection (`SetMaxOpenConns(1)`) so connection-scoped
+`search_path` state and `Set*Views` catalog replacements stay serialized against
+read-only query transactions. Waiting for the connection is governed by the
+caller's `ctx`, while `QueryTimeout` starts only after the connection is
+acquired and applies to query execution. Timed-out or canceled queries return
+`context.DeadlineExceeded` or `context.Canceled` directly (without the engine's
+multi-line `INTERRUPT Error` text). Pass a context with a shorter deadline to
+bound queue wait + execution together, or add a host semaphore in front of
+`QueryWith` if you want immediate rejection when busy.
+
+`Open` sets `Calendar = 'gregorian'` and `TimeZone` (default `"UTC"`, overridable
+via `Options.TimeZone`) before locking configuration, so timestamp rendering and
+date-literal comparisons do not drift with the host machine's local zone. Hosts
+that want exchange-local output for specific queries can use `AT TIME ZONE` in
+SQL or set `Options.TimeZone` at `Open`.
 
 Zero limits select the defaults shown above; negatives are errors. `MaxRows`
 must not exceed `math.MaxInt-1`, leaving room to fetch one extra row. CSV is the
@@ -114,6 +122,12 @@ CSV so readers keep the row.
 `JSONColumnar` one object of column arrays, `{"n":[1],"s":["x"]}`. Both are
 serialized by DuckDB's `to_json`, so numbers, booleans, nulls, lists, and structs
 keep native JSON types while dates, timestamps, intervals, and blobs are strings.
+Top-level `TIMESTAMPTZ` and `TIMESTAMPTZ_NS` columns are formatted in SQL as
+RFC 3339 strings in the configured `TimeZone` (for example
+`"2026-09-01T08:01:42.622909564Z"` under the default `"UTC"`, or
+`"2026-09-01T04:01:42.622909564-04:00"` under `"America/New_York"`), and naive
+`TIMESTAMP` / `TIMESTAMP_NS` columns use the ISO 8601 `'T'` separator
+(`"2026-09-01T08:01:42.5"`), while `NULL` timestamps remain JSON `null`.
 Empty results are `[]` and `{"n":[]}`. Row order follows the query's `ORDER BY`.
 DuckDB suffixes duplicate column names (`n`, `n_1`) and writes non-finite doubles
 as bare `Infinity` or `NaN`, which strict parsers reject; cast or filter them in
@@ -126,9 +140,9 @@ or select fewer columns. Trailing semicolons are ignored.
 
 `QueryWith(ctx, sql, ntduckbox.QueryOptions{...})` adjusts one call and returns
 a `Result` with `Text`, `Rows` (data rows), `Bytes` (`len(Text)`), `Truncated`,
-and `Elapsed` (wall time inside `QueryWith`, including connection wait).
-`MaxRows` and `MaxChars` lower the row and byte caps for that call; the host
-limits from `Open` stay the ceiling and larger values are errors. `Truncate`
+and `Elapsed` (total wall time inside `QueryWith`, including connection queue
+wait). `MaxRows` and `MaxChars` lower the row and byte caps for that call; the
+host limits from `Open` stay the ceiling and larger values are errors. `Truncate`
 returns the whole rows that fit within both `MaxRows` and `MaxChars` instead of
 `ErrResultLimit` and sets `Truncated`, so a host can tell its caller that more
 rows exist. CSV and Markdown stop at the last whole row within both limits;
@@ -145,7 +159,8 @@ sentinel errors so callers can branch with `errors.Is`:
 
 - `ErrNotSelect`: empty query, multi-statement batch, or non-`SELECT` statement
   (DDL, DML, `COPY`, `ATTACH`, `DETACH`, `LOAD`, `INSTALL`, `SET`, `RESET`,
-  `PRAGMA`, `CALL`, `EXPORT`, `IMPORT`).
+  `PRAGMA`, `CALL`, `EXPORT`, `IMPORT`, `EXPLAIN`, or dynamic `PIVOT` without
+  `IN (...)`).
 - `ErrPermission`: access denied by `allowed_directories`, `enable_external_access=false`,
   `disabled_filesystems`, or `lock_configuration=true` (including `read_parquet`,
   `read_csv`, `read_blob`, `read_text`, `glob`, and single- or double-quoted file
@@ -153,6 +168,18 @@ sentinel errors so callers can branch with `errors.Is`:
 - `ErrBinder`: syntax, catalog, or binder error inside a `SELECT` query (such as
   an unknown table or column, a type mismatch, or `query('...')` of a non-`SELECT`
   statement).
+
+| Statement form | Status | Notes |
+| --- | --- | --- |
+| `SELECT ...`, `WITH ... SELECT ...` | Accepted | Standard queries and CTEs |
+| `FROM t [SELECT ...]`, `TABLE t`, `VALUES (...)` | Accepted | DuckDB query shorthands |
+| `DESCRIBE <table\|query>`, `SUMMARIZE <table\|query>`, `SHOW TABLES` | Accepted | Compile to `STATEMENT_TYPE_SELECT` inside the subquery wrapper |
+| `UNPIVOT t ON ... INTO NAME ... VALUE ...` | Accepted | Static output schema |
+| `PIVOT t ON col IN (...) USING ...` | Accepted | Explicit `IN (...)` list keeps the output schema static |
+| `PIVOT t ON col USING ...` (no `IN`) | Rejected (`ErrNotSelect`) | Dynamic `PIVOT` rewrites to a multi-statement `CREATE TEMPORARY TYPE` batch |
+| `EXPLAIN ...` | Rejected (`ErrNotSelect`) | Returns `"EXPLAIN is not supported"` |
+| DDL, DML, `COPY`, `ATTACH`, `DETACH`, `LOAD`, `INSTALL`, `SET`, `RESET`, `PRAGMA`, `CALL`, `EXPORT`, `IMPORT`, `a; b` | Rejected (`ErrNotSelect`) | Rejected at `Conn.Prepare` before execution |
+| File reads or quoted `FROM` paths outside `AllowedDirs` | Rejected (`ErrPermission`) | Enforced by `allowed_directories` and `enable_external_access=false` |
 
 An empty Path or `:memory:` creates an empty in-memory database. DuckDB does not
 support opening an in-memory database with `access_mode=read_only`; internally
@@ -334,6 +361,7 @@ Before returning a DB, Open configures:
 - File-backed `access_mode=read_only`, and `READ_ONLY` attachments for every
   `Options.Attach` entry (with `search_path` set to `main` followed by each
   attached catalog's `main` schema).
+- `Calendar = 'gregorian'` and `TimeZone` (default `"UTC"`, or `Options.TimeZone`).
 - Extension autoloading, autoinstallation, unsigned extensions, and community
   extensions disabled at engine creation.
 - Explicit `allowed_directories`, empty `allowed_paths` and `allowed_configs`.
@@ -387,7 +415,8 @@ This is an engine policy boundary, not an OS/process sandbox. It does not defend
 against native-engine vulnerabilities, malicious database/Parquet files, host
 filesystem mutation, or CPU/memory exhaustion. Output limits bound returned text,
 not engine allocations or intermediate results. Timeouts use driver cancellation
-and include connection queueing and execution; native single-statement validation
+and apply to execution after acquiring the connection (while connection queueing
+is governed by the caller's context); native single-statement validation
 currently uses a non-cancellable prepare call, so the timeout is not a hard
 wall-clock guarantee during preparation or blocked native I/O. When those
 guarantees are required, run the host process in a container or VM, give it a

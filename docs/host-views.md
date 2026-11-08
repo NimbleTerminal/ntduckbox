@@ -189,8 +189,10 @@ Databento and Arrow Parquet files often store nanosecond timestamps as
 `i64::MAX` or `-1` nanoseconds before the Unix epoch):
 
 - **Rendering:** `TIMESTAMPTZ_NS` survives `COLUMNS(*)::VARCHAR` (`CSV` and
-  `Markdown`) and `to_json` (`JSONRows` and `JSONColumnar`) cleanly, preserving
-  all 9 fractional nanosecond digits (for example `2023-11-14 17:13:20.123456789-05`).
+  `Markdown`, e.g. `2023-11-14 22:13:20.123456789+00` under default `UTC`) and
+  `to_json` (`JSONRows` and `JSONColumnar`, formatted as RFC 3339
+  `2023-11-14T22:13:20.123456789Z`) cleanly, preserving all 9 fractional
+  nanosecond digits.
 - **Comparison and function friction:** DuckDB rejects direct comparisons
   between `TIMESTAMPTZ_NS` and standard microsecond `TIMESTAMPTZ` literals with
   a `Binder Error` (`Cannot compare values of type TIMESTAMPTZ_NS and type

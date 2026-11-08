@@ -91,8 +91,9 @@ type Options struct {
 	AllowedDirs  []string      // Explicit opt-in to local file reads, including all descendants.
 	MaxRows      int           // Default 1000; must not exceed math.MaxInt-1.
 	MaxChars     int           // Default 100000; measured in UTF-8 bytes (a stricter bound than characters).
-	QueryTimeout time.Duration // Default 10 seconds; includes waiting for a connection.
+	QueryTimeout time.Duration // Default 10 seconds; applies to query execution after acquiring the connection.
 	Format       Format        // Default CSV.
+	TimeZone     string        // Session IANA time zone set before lockdown; default "UTC".
 }
 
 // DB owns an isolated DuckDB connection pool with immutable security settings.
@@ -131,6 +132,9 @@ func Open(opts Options) (*DB, error) {
 	}
 	if !opts.Format.valid() {
 		return nil, errors.New("format must be csv, markdown, json_rows, or json_columnar")
+	}
+	if strings.TrimSpace(opts.TimeZone) == "" {
+		opts.TimeZone = "UTC"
 	}
 	dirs := make([]string, 0, len(opts.AllowedDirs))
 	for _, dir := range opts.AllowedDirs {
@@ -222,7 +226,7 @@ func Open(opts Options) (*DB, error) {
 	pool.SetMaxOpenConns(1)
 	pool.SetMaxIdleConns(1)
 	fail := func(err error) (*DB, error) { return nil, errors.Join(err, pool.Close()) }
-	setup := make([]string, 0, len(attachments)+8)
+	setup := make([]string, 0, len(attachments)+10)
 	for _, att := range attachments {
 		setup = append(setup, "ATTACH "+literal(att.Path)+" AS "+identifier(att.Alias)+" (READ_ONLY)")
 	}
@@ -232,6 +236,8 @@ func Open(opts Options) (*DB, error) {
 		setup = append(setup, "SET search_path = "+literal(searchPath))
 	}
 	setup = append(setup,
+		"SET Calendar = 'gregorian'",
+		"SET TimeZone = "+literal(opts.TimeZone),
 		"SET temp_directory = ''",
 		"SET allowed_directories = ["+strings.Join(dirs, ",")+"]",
 		"SET allowed_paths = []", "SET allowed_configs = []",
@@ -435,15 +441,15 @@ func (db *DB) replaceViewSet(ctx context.Context, replaceKinds map[ViewKind]bool
 	}
 	names := append(baseNames, sqlNames...)
 
-	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
-	defer cancel()
 	conn, err := db.conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
-		return err
+	execCtx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
+	defer cancel()
+	if _, err := conn.ExecContext(execCtx, "BEGIN TRANSACTION"); err != nil {
+		return cleanExecErr(execCtx, err)
 	}
 	apply := func() error {
 		created := make([]string, 0, len(names))
@@ -453,13 +459,13 @@ func (db *DB) replaceViewSet(ctx context.Context, replaceKinds map[ViewKind]bool
 				if !replaceKinds[db.views[name].Kind] {
 					continue
 				}
-				if _, err := conn.ExecContext(ctx, "DROP VIEW IF EXISTS main."+identifier(name)); err != nil {
+				if _, err := conn.ExecContext(execCtx, "DROP VIEW IF EXISTS main."+identifier(name)); err != nil {
 					return err
 				}
 			}
 			for _, name := range created {
 				stmt := "CREATE OR REPLACE VIEW main." + identifier(name) + " AS " + createdSQL[name]
-				if _, err := conn.ExecContext(ctx, stmt); err != nil {
+				if _, err := conn.ExecContext(execCtx, stmt); err != nil {
 					return err
 				}
 			}
@@ -474,10 +480,10 @@ func (db *DB) replaceViewSet(ctx context.Context, replaceKinds map[ViewKind]bool
 			var firstErr error
 			progressed := false
 			for _, name := range pending {
-				selectSQL, err := specs[name].build(ctx, conn)
+				selectSQL, err := specs[name].build(execCtx, conn)
 				if err == nil {
 					stmt := "CREATE OR REPLACE VIEW main." + identifier(name) + " AS " + selectSQL
-					_, err = conn.ExecContext(ctx, stmt)
+					_, err = conn.ExecContext(execCtx, stmt)
 				}
 				if err != nil {
 					if firstErr == nil {
@@ -487,7 +493,7 @@ func (db *DB) replaceViewSet(ctx context.Context, replaceKinds map[ViewKind]bool
 					// A failed Prepare or CREATE VIEW marks the DuckDB transaction
 					// as aborted; roll back and replay the known-good prefix.
 					db.rollback(conn)
-					if _, rbErr := conn.ExecContext(ctx, "BEGIN TRANSACTION"); rbErr != nil {
+					if _, rbErr := conn.ExecContext(execCtx, "BEGIN TRANSACTION"); rbErr != nil {
 						return firstErr
 					}
 					if rbErr := resetTx(); rbErr != nil {
@@ -514,7 +520,7 @@ func (db *DB) replaceViewSet(ctx context.Context, replaceKinds map[ViewKind]bool
 				if err := validateSelect(conn, probe, probe); err != nil {
 					broken = append(broken, fmt.Errorf("view %s invalidated: %w", name, err))
 					db.rollback(conn)
-					if _, rbErr := conn.ExecContext(ctx, "BEGIN TRANSACTION"); rbErr != nil {
+					if _, rbErr := conn.ExecContext(execCtx, "BEGIN TRANSACTION"); rbErr != nil {
 						break
 					}
 					if rbErr := resetTx(); rbErr != nil {
@@ -526,12 +532,12 @@ func (db *DB) replaceViewSet(ctx context.Context, replaceKinds map[ViewKind]bool
 				return errors.Join(broken...)
 			}
 		}
-		_, err := conn.ExecContext(ctx, "COMMIT")
+		_, err := conn.ExecContext(execCtx, "COMMIT")
 		return err
 	}
 	if err := apply(); err != nil {
 		db.rollback(conn)
-		return fmt.Errorf("set views: %w", err)
+		return fmt.Errorf("set views: %w", cleanExecErr(execCtx, err))
 	}
 	if db.views == nil {
 		db.views = make(map[string]ViewInfo, len(specs))
@@ -553,9 +559,11 @@ func (db *DB) conn(ctx context.Context) (*sql.Conn, error) {
 		return nil, err
 	}
 	if db.searchPath != "" && db.resetSearchPath.Load() {
-		if _, err := conn.ExecContext(ctx, "SET search_path = "+literal(db.searchPath)); err != nil {
+		setupCtx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
+		defer cancel()
+		if _, err := conn.ExecContext(setupCtx, "SET search_path = "+literal(db.searchPath)); err != nil {
 			_ = conn.Close()
-			return nil, err
+			return nil, cleanExecErr(setupCtx, err)
 		}
 		db.resetSearchPath.Store(false)
 	}
@@ -570,21 +578,36 @@ func (db *DB) rollback(conn *sql.Conn) {
 	}
 }
 
+func cleanExecErr(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		var e *engineError
+		if (errors.As(err, &e) && e.Type == engineErrorInterrupt) ||
+			errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, context.Canceled) {
+			return ctxErr
+		}
+	}
+	return err
+}
+
 // Validate checks that query is a single SELECT statement whose referenced
 // tables, columns, functions, and file paths are permitted and bind cleanly
 // against the current catalog. It uses the same subquery wrapper and native
 // single-statement Prepare check as QueryWith without executing rows.
 // Rejected queries wrap ErrNotSelect, ErrPermission, or ErrBinder.
 func (db *DB) Validate(ctx context.Context, query string) error {
-	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
-	defer cancel()
 	conn, err := db.conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	if _, err = conn.ExecContext(ctx, "BEGIN TRANSACTION READ ONLY"); err != nil {
-		return err
+	execCtx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
+	defer cancel()
+	if _, err = conn.ExecContext(execCtx, "BEGIN TRANSACTION READ ONLY"); err != nil {
+		return cleanExecErr(execCtx, err)
 	}
 	defer db.rollback(conn)
 	trimmed := strings.TrimRight(strings.TrimSpace(query), "; \t\r\n")
@@ -605,6 +628,10 @@ func validateSelect(conn *sql.Conn, wrapped, userQuery string) error {
 	if strings.TrimSpace(userQuery) == "" {
 		return fmt.Errorf("%w: empty query", ErrNotSelect)
 	}
+	kw := firstKeyword(userQuery)
+	if kw == "EXPLAIN" {
+		return fmt.Errorf("%w: EXPLAIN is not supported", ErrNotSelect)
+	}
 	return conn.Raw(func(raw any) error {
 		stmt, err := raw.(*engineConn).Prepare(wrapped)
 		if err != nil {
@@ -616,6 +643,9 @@ func validateSelect(conn *sql.Conn, wrapped, userQuery string) error {
 			return err
 		}
 		if typ != engineSelect {
+			if kw == "PIVOT" {
+				return fmt.Errorf("%w: dynamic PIVOT without an IN (...) list is not supported; specify IN (...) or use CASE aggregates", ErrNotSelect)
+			}
 			return fmt.Errorf("%w: only SELECT queries are allowed", ErrNotSelect)
 		}
 		return nil
@@ -625,7 +655,13 @@ func validateSelect(conn *sql.Conn, wrapped, userQuery string) error {
 func classifyPrepError(err error, userQuery string) error {
 	var e *engineError
 	if !errors.As(err, &e) {
-		if strings.Contains(err.Error(), "multi-statement") || !hasSelectPrefix(userQuery) {
+		if strings.Contains(err.Error(), "multi-statement") {
+			if firstKeyword(userQuery) == "PIVOT" && !strings.Contains(userQuery, ";") {
+				return fmt.Errorf("%w: dynamic PIVOT without an IN (...) list is not supported; specify IN (...) or use CASE aggregates", ErrNotSelect)
+			}
+			return fmt.Errorf("%w: %w", ErrNotSelect, err)
+		}
+		if !hasSelectPrefix(userQuery) {
 			return fmt.Errorf("%w: %w", ErrNotSelect, err)
 		}
 		return err
@@ -651,12 +687,21 @@ func classifyPrepError(err error, userQuery string) error {
 }
 
 func hasSelectPrefix(s string) bool {
+	switch firstKeyword(s) {
+	case "SELECT", "WITH", "VALUES", "FROM", "TABLE", "PIVOT", "UNPIVOT", "DESCRIBE", "DESC", "SUMMARIZE", "SHOW":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstKeyword(s string) string {
 	for {
 		s = strings.TrimSpace(s)
 		if strings.HasPrefix(s, "--") {
 			_, rest, ok := strings.Cut(s, "\n")
 			if !ok {
-				return false
+				return ""
 			}
 			s = rest
 			continue
@@ -664,7 +709,7 @@ func hasSelectPrefix(s string) bool {
 		if strings.HasPrefix(s, "/*") {
 			_, rest, ok := strings.Cut(s[2:], "*/")
 			if !ok {
-				return false
+				return ""
 			}
 			s = rest
 			continue
@@ -683,12 +728,7 @@ func hasSelectPrefix(s string) bool {
 			break
 		}
 	}
-	switch strings.ToUpper(word.String()) {
-	case "SELECT", "WITH", "VALUES", "FROM", "TABLE", "PIVOT", "UNPIVOT":
-		return true
-	default:
-		return false
-	}
+	return strings.ToUpper(word.String())
 }
 
 func identifier(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
@@ -758,16 +798,16 @@ func (db *DB) run(ctx context.Context, query string, opts QueryOptions, describe
 		opts.MaxChars = db.opts.MaxChars
 	}
 	format := opts.Format
-	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
-	defer cancel()
 	conn, err := db.conn(ctx)
 	if err != nil {
 		return Result{}, err
 	}
 	defer conn.Close()
+	execCtx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
+	defer cancel()
 	// DuckDB's Go BeginTx does not support ReadOnly, but the SQL engine does.
-	if _, err = conn.ExecContext(ctx, "BEGIN TRANSACTION READ ONLY"); err != nil {
-		return Result{}, err
+	if _, err = conn.ExecContext(execCtx, "BEGIN TRANSACTION READ ONLY"); err != nil {
+		return Result{}, cleanExecErr(execCtx, err)
 	}
 	defer db.rollback(conn)
 	trimmed := strings.TrimRight(strings.TrimSpace(query), "; \t\r\n")
@@ -797,9 +837,9 @@ func (db *DB) run(ctx context.Context, query string, opts QueryOptions, describe
 		return Result{}, fmt.Errorf("query rejected: %w", err)
 	}
 	if format.isJSON() {
-		res, err := queryJSON(ctx, conn, jsonSource, format, opts.MaxRows, opts.MaxChars, opts.Truncate)
+		res, err := queryJSON(execCtx, conn, jsonSource, format, opts.MaxRows, opts.MaxChars, opts.Truncate)
 		if err != nil {
-			return Result{}, err
+			return Result{}, cleanExecErr(execCtx, err)
 		}
 		res.Elapsed = time.Since(start)
 		return res, nil
@@ -807,14 +847,14 @@ func (db *DB) run(ctx context.Context, query string, opts QueryOptions, describe
 	if describe {
 		wrapped = "DESCRIBE " + wrapped
 	}
-	rows, err := conn.QueryContext(ctx, wrapped)
+	rows, err := conn.QueryContext(execCtx, wrapped)
 	if err != nil {
-		return Result{}, err
+		return Result{}, cleanExecErr(execCtx, err)
 	}
 	defer rows.Close()
-	res, err := render(ctx, rows, format, opts.MaxRows, opts.MaxChars, opts.Truncate)
+	res, err := render(execCtx, rows, format, opts.MaxRows, opts.MaxChars, opts.Truncate)
 	if err != nil {
-		return Result{}, err
+		return Result{}, cleanExecErr(execCtx, err)
 	}
 	res.Elapsed = time.Since(start)
 	return res, nil
@@ -844,24 +884,24 @@ func (db *DB) Columns(ctx context.Context, names ...string) ([]Column, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
-	defer cancel()
 	conn, err := db.conn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	if _, err = conn.ExecContext(ctx, "BEGIN TRANSACTION READ ONLY"); err != nil {
-		return nil, err
+	execCtx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
+	defer cancel()
+	if _, err = conn.ExecContext(execCtx, "BEGIN TRANSACTION READ ONLY"); err != nil {
+		return nil, cleanExecErr(execCtx, err)
 	}
 	defer db.rollback(conn)
 	probe := "SELECT * FROM " + rel
 	if err := validateSelect(conn, probe, probe); err != nil {
 		return nil, fmt.Errorf("query rejected: %w", err)
 	}
-	rows, err := conn.QueryContext(ctx, "DESCRIBE "+probe)
+	rows, err := conn.QueryContext(execCtx, "DESCRIBE "+probe)
 	if err != nil {
-		return nil, err
+		return nil, cleanExecErr(execCtx, err)
 	}
 	defer rows.Close()
 	var cols []Column
@@ -869,12 +909,12 @@ func (db *DB) Columns(ctx context.Context, names ...string) ([]Column, error) {
 		var name, colType string
 		var null, key, def, extra sql.NullString
 		if err := rows.Scan(&name, &colType, &null, &key, &def, &extra); err != nil {
-			return nil, err
+			return nil, cleanExecErr(execCtx, err)
 		}
 		cols = append(cols, Column{Name: name, Type: colType})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, cleanExecErr(execCtx, err)
 	}
 	return cols, nil
 }

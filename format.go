@@ -51,6 +51,13 @@ func jsonQuery(source string, format Format, maxRows int) string {
 // exceeds maxChars, re-runs with a smaller row cap derived from average row
 // size so DuckDB's to_json still produces a valid JSON document within maxChars.
 func queryJSON(ctx context.Context, conn *sql.Conn, source string, format Format, maxRows, maxChars int, truncate bool) (Result, error) {
+	if !strings.HasPrefix(source, "DESCRIBE ") {
+		rewritten, err := rewriteJSONTimestamps(ctx, conn, source)
+		if err != nil {
+			return Result{}, err
+		}
+		source = rewritten
+	}
 	count, text, err := scanJSON(ctx, conn, jsonQuery(source, format, maxRows))
 	if err != nil {
 		return Result{}, err
@@ -85,6 +92,55 @@ func queryJSON(ctx context.Context, conn *sql.Conn, source string, format Format
 		}
 	}
 	return Result{Text: text, Rows: rowCap, Bytes: len(text), Truncated: true}, nil
+}
+
+// rewriteJSONTimestamps wraps source with SELECT * REPLACE (...) when top-level
+// columns are DuckDB timestamp types so to_json emits ISO 8601 / RFC 3339 strings
+// (for example "2026-09-01T08:01:42.622909564Z" or "...-04:00") while keeping
+// nanosecond precision and SQL NULL -> JSON null.
+func rewriteJSONTimestamps(ctx context.Context, conn *sql.Conn, source string) (string, error) {
+	rows, err := conn.QueryContext(ctx, "DESCRIBE "+source)
+	if err != nil {
+		return source, nil
+	}
+	defer rows.Close()
+	type colMeta struct {
+		name string
+		typ  string
+	}
+	var cols []colMeta
+	counts := make(map[string]int)
+	for rows.Next() {
+		var name, colType string
+		var null, key, def, extra sql.NullString
+		if err := rows.Scan(&name, &colType, &null, &key, &def, &extra); err != nil {
+			return "", err
+		}
+		cols = append(cols, colMeta{name: name, typ: colType})
+		counts[name]++
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	var replacements []string
+	for _, c := range cols {
+		if counts[c.name] != 1 {
+			continue
+		}
+		id := identifier(c.name)
+		switch c.typ {
+		case "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ", "TIMESTAMPTZ_NS":
+			replacements = append(replacements,
+				"regexp_replace(regexp_replace(replace("+id+"::VARCHAR, ' ', 'T'), '[+-]00$', 'Z'), '([+-][0-9]{2})$', '\\1:00') AS "+id)
+		case "TIMESTAMP", "TIMESTAMP_NS", "TIMESTAMP_MS", "TIMESTAMP_S":
+			replacements = append(replacements,
+				"replace("+id+"::VARCHAR, ' ', 'T') AS "+id)
+		}
+	}
+	if len(replacements) == 0 {
+		return source, nil
+	}
+	return "SELECT * REPLACE (" + strings.Join(replacements, ", ") + ") FROM (" + source + ")", nil
 }
 
 func scanJSON(ctx context.Context, conn *sql.Conn, query string) (int, string, error) {

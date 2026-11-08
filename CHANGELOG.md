@@ -2,6 +2,9 @@
 
 ## Unreleased (2026-11-08)
 
+ * Start `QueryTimeout` after acquiring the pooled connection so queued queries are not penalized by an earlier slow query's execution time, and strip the engine's multi-line `INTERRUPT Error` suffix from timed-out or canceled query errors.
+ * Add `Options.TimeZone` (default `"UTC"`) and pin `Calendar = 'gregorian'` before locking configuration, and format top-level `TIMESTAMPTZ` / `TIMESTAMPTZ_NS` and `TIMESTAMP` / `TIMESTAMP_NS` columns in `JSONRows` and `JSONColumnar` as RFC 3339 / ISO 8601 strings inside DuckDB's `to_json` query.
+ * Document the accepted and rejected SQL statement surface (`DESCRIBE`, `SUMMARIZE`, `SHOW TABLES`, `UNPIVOT`, and static `PIVOT ... ON col IN (...)`), and return explicit `ErrNotSelect` messages for `EXPLAIN` and dynamic `PIVOT` without `IN (...)`.
  * Add `SetAllViews` (`ViewSet{Parquet, CSV, SQL}`) to replace Parquet, CSV, and SQL views atomically in a single transaction, and enumerate every invalidated SQL view when a standalone `SetParquetViews` or `SetCSVViews` update breaks remaining SQL views.
  * Add `Validate(ctx, sql)` and sentinel errors `ErrNotSelect`, `ErrPermission`, and `ErrBinder` so hosts can validate queries or classify query rejections with `errors.Is` without maintaining a separate SQL regex allowlist.
  * Add structured catalog introspection: `Columns(ctx, names...)` returning `[]Column{Name, Type}` (`CSVColumn` is now an alias for `Column`) and `Views(ctx)` returning `[]ViewInfo{Name, Kind, Source}` (`ParquetViewKind`, `CSVViewKind`, `SQLViewKind`).

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -166,8 +167,12 @@ func TestTimeoutAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	if _, err := db.Query(context.Background(), "SELECT sum(a.i*b.i) FROM range(1000000000) a(i), range(1000000000) b(i)"); err == nil {
-		t.Fatal("expected timeout")
+	_, err := db.Query(context.Background(), "SELECT sum(a.i*b.i) FROM range(1000000000) a(i), range(1000000000) b(i)")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+	}
+	if strings.Contains(err.Error(), "INTERRUPT") || strings.Contains(err.Error(), "\n") {
+		t.Fatalf("timed-out error should not include multi-line engine interrupt text: %q", err.Error())
 	}
 	if time.Since(start) > 5*time.Second {
 		t.Fatal("cancellation took too long")
@@ -285,7 +290,7 @@ func TestLockedSettings(t *testing.T) {
 		"autoinstall_known_extensions": "false", "allow_unsigned_extensions": "false",
 		"allow_community_extensions": "false", "lock_configuration": "true",
 		"allowed_configs": "[]", "allowed_paths": "[]", "allowed_directories": "[]",
-		"temp_directory": "",
+		"temp_directory": "", "TimeZone": "UTC", "Calendar": "gregorian",
 	} {
 		var got string
 		if err := db.pool.QueryRow("SELECT current_setting(?)::VARCHAR", name).Scan(&got); err != nil {
@@ -1489,6 +1494,179 @@ func TestValuesMetadataAndNanosecondTimestamps(t *testing.T) {
 		}
 		if err := db.Validate(ctx, "SELECT * FROM tz_bbo WHERE ts_event >= TIMESTAMPTZ '2020-01-01 00:00:00Z'"); !errors.Is(err, ErrBinder) {
 			t.Fatalf("expected TIMESTAMPTZ_NS vs TIMESTAMPTZ comparison to fail with ErrBinder, got %v", err)
+		}
+	}
+}
+
+func TestQueueWaitDoesNotConsumeQueryTimeout(t *testing.T) {
+	db := openTest(t, Options{QueryTimeout: 120 * time.Millisecond})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var errA, errB, errC error
+	var resB, resC Result
+
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		_, errA = db.Query(ctx, "SELECT sum(a.i*b.i) FROM range(1000000000) a(i), range(1000000000) b(i)")
+	}()
+	time.Sleep(25 * time.Millisecond)
+	go func() {
+		defer wg.Done()
+		resB, errB = db.QueryWith(ctx, "SELECT 1 AS n", QueryOptions{})
+	}()
+	time.Sleep(25 * time.Millisecond)
+	go func() {
+		defer wg.Done()
+		resC, errC = db.QueryWith(ctx, "SELECT 2 AS n", QueryOptions{})
+	}()
+	wg.Wait()
+
+	if !errors.Is(errA, context.DeadlineExceeded) {
+		t.Fatalf("expected slow query A to fail with DeadlineExceeded, got %v", errA)
+	}
+	if errB != nil || resB.Text != "n\n1\n" || resB.Elapsed < 40*time.Millisecond {
+		t.Fatalf("queued query B: res=%#v err=%v", resB, errB)
+	}
+	if errC != nil || resC.Text != "n\n2\n" || resC.Elapsed < 40*time.Millisecond {
+		t.Fatalf("queued query C: res=%#v err=%v", resC, errC)
+	}
+}
+
+func TestTimeZoneCalendarAndJSONTimestamps(t *testing.T) {
+	ctx := context.Background()
+	if bad, err := Open(Options{TimeZone: "Not/AZone"}); err == nil {
+		bad.Close()
+		t.Fatal("invalid TimeZone accepted")
+	}
+
+	dbUTC := openTest(t, Options{})
+	var tz, cal string
+	if err := dbUTC.pool.QueryRow("SELECT current_setting('TimeZone')::VARCHAR, current_setting('Calendar')::VARCHAR").Scan(&tz, &cal); err != nil {
+		t.Fatal(err)
+	}
+	if tz != "UTC" || cal != "gregorian" {
+		t.Fatalf("settings: TimeZone=%q Calendar=%q, want UTC and gregorian", tz, cal)
+	}
+	for _, stmt := range []string{"SET TimeZone = 'America/New_York'", "SET Calendar = 'japanese'"} {
+		_, err := dbUTC.pool.Exec(stmt)
+		assertEngineError(t, err, engineErrorInvalidInput, "configuration has been locked")
+	}
+
+	gotRows, err := dbUTC.QueryFormat(ctx, `
+		SELECT
+			TIMESTAMPTZ '2026-09-01 08:01:42.622909Z' AS tstz,
+			TIMESTAMP '2026-09-01 08:01:42.5' AS ts,
+			make_timestamp_ns(1700000000123456789) AS ts_ns,
+			NULL::TIMESTAMPTZ AS z
+	`, JSONRows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRows := `[{"tstz":"2026-09-01T08:01:42.622909Z","ts":"2026-09-01T08:01:42.5","ts_ns":"2023-11-14T22:13:20.123456789","z":null}]`
+	if gotRows != wantRows {
+		t.Fatalf("UTC JSONRows:\n got %s\nwant %s", gotRows, wantRows)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, "2026-09-01T08:01:42.622909Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	gotCol, err := dbUTC.QueryFormat(ctx, `SELECT TIMESTAMPTZ '2026-09-01 08:01:42.622909Z' AS tstz, NULL::TIMESTAMPTZ AS z`, JSONColumnar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotCol != `{"tstz":["2026-09-01T08:01:42.622909Z"],"z":[null]}` {
+		t.Fatalf("UTC JSONColumnar: got %s", gotCol)
+	}
+
+	if Engine == "duckdb" {
+		gotNS, err := dbUTC.QueryFormat(ctx, `SELECT TIMESTAMPTZ_NS '2026-09-01 08:01:42.622909564Z' AS tstz_ns`, JSONRows)
+		if err != nil || gotNS != `[{"tstz_ns":"2026-09-01T08:01:42.622909564Z"}]` {
+			t.Fatalf("UTC TIMESTAMPTZ_NS JSONRows: %s %v", gotNS, err)
+		}
+	}
+
+	dbNY := openTest(t, Options{TimeZone: "America/New_York"})
+	gotNY, err := dbNY.QueryFormat(ctx, `SELECT TIMESTAMPTZ '2026-09-01 08:01:42.622909Z' AS tstz`, JSONRows)
+	if err != nil || gotNY != `[{"tstz":"2026-09-01T04:01:42.622909-04:00"}]` {
+		t.Fatalf("America/New_York JSONRows: %s %v", gotNY, err)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, "2026-09-01T04:01:42.622909-04:00"); err != nil {
+		t.Fatal(err)
+	}
+	gotNYCSV, err := dbNY.Query(ctx, `SELECT TIMESTAMPTZ '2026-09-01 08:01:42.622909Z' AS tstz`)
+	if err != nil || gotNYCSV != "tstz\n2026-09-01 04:01:42.622909-04\n" {
+		t.Fatalf("America/New_York CSV: %q %v", gotNYCSV, err)
+	}
+	conn, err := dbNY.pool.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbNY.rollback(conn)
+	_ = conn.Close()
+	gotNYAfter, err := dbNY.QueryFormat(ctx, `SELECT TIMESTAMPTZ '2026-09-01 08:01:42.622909Z' AS tstz`, JSONRows)
+	if err != nil || gotNYAfter != `[{"tstz":"2026-09-01T04:01:42.622909-04:00"}]` {
+		t.Fatalf("America/New_York after connection replacement: %s %v", gotNYAfter, err)
+	}
+}
+
+func TestStatementSurfacePivotAndExplain(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t, Options{Path: ":memory:"})
+	if err := db.SetViews(ctx, map[string]string{
+		"sales": "SELECT * FROM (VALUES ('AAPL', 'Q1', 10, 20), ('AAPL', 'Q2', 30, 40)) AS t(symbol, quarter, bids, asks)",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, q := range map[string]string{
+		"select":       "SELECT symbol, bids FROM sales",
+		"with_select":  "WITH c AS (SELECT * FROM sales) SELECT symbol FROM c",
+		"from_first":   "FROM sales SELECT symbol, quarter",
+		"table":        "TABLE sales",
+		"values":       "VALUES ('AAPL', 10), ('MSFT', 20)",
+		"describe":     "DESCRIBE sales",
+		"summarize":    "SUMMARIZE sales",
+		"show_tables":  "SHOW TABLES",
+		"unpivot":      "UNPIVOT sales ON bids, asks INTO NAME side VALUE qty",
+		"static_pivot": "PIVOT sales ON quarter IN ('Q1', 'Q2') USING sum(bids)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := db.Validate(ctx, q); err != nil {
+				t.Fatalf("Validate(%s) failed: %v", q, err)
+			}
+			for _, format := range []Format{CSV, JSONRows} {
+				if _, err := db.QueryFormat(ctx, q, format); err != nil {
+					t.Fatalf("QueryFormat(%s, %s) failed: %v", q, format, err)
+				}
+			}
+		})
+	}
+
+	// Dynamic PIVOT without IN (...) requires temporary enum creation and is rejected clearly.
+	for _, err := range []error{
+		db.Validate(ctx, "PIVOT sales ON quarter USING sum(bids)"),
+		func() error { _, err := db.Query(ctx, "PIVOT sales ON quarter USING sum(bids)"); return err }(),
+	} {
+		if !errors.Is(err, ErrNotSelect) || !strings.Contains(err.Error(), "IN (...)") {
+			t.Fatalf("expected ErrNotSelect mentioning IN (...), got %v", err)
+		}
+	}
+
+	// EXPLAIN is rejected with a direct message rather than a wrapper parser error.
+	for _, explainQuery := range []string{
+		"EXPLAIN SELECT * FROM sales",
+		"/* comment */ EXPLAIN ANALYZE SELECT 1",
+	} {
+		for _, err := range []error{
+			db.Validate(ctx, explainQuery),
+			func() error { _, err := db.Query(ctx, explainQuery); return err }(),
+		} {
+			if !errors.Is(err, ErrNotSelect) || !strings.Contains(err.Error(), "EXPLAIN is not supported") {
+				t.Fatalf("query %q: expected ErrNotSelect with 'EXPLAIN is not supported', got %v", explainQuery, err)
+			}
 		}
 	}
 }

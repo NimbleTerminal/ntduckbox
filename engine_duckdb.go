@@ -33,6 +33,7 @@ const (
 	engineErrorCatalog      = duckdb.ErrorTypeCatalog
 	engineErrorParser       = duckdb.ErrorTypeParser
 	engineErrorSyntax       = duckdb.ErrorTypeSyntax
+	engineErrorInterrupt    = duckdb.ErrorTypeInterrupt
 )
 
 func newEngineConnector(dsn string) (driver.Connector, error) { return duckdb.NewConnector(dsn, nil) }
