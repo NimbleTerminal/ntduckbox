@@ -79,9 +79,14 @@ type Attachment struct {
   is no write-access option.
 - Because `ATTACH` runs before `enable_external_access = false`, the directory
   containing the `.duckdb` file does **not** need to be added to `AllowedDirs`.
-  Untrusted SQL can query the attached catalog's tables, but cannot read sibling
-  files (such as secrets, configs, or other `.duckdb` or `.csv` files) in the
-  same directory.
+  Untrusted SQL can query the attached catalog's tables, and cannot read sibling
+  files (such as secrets, configs, or other `.duckdb` or `.csv` files) or write
+  in that directory. Note that DuckDB treats the attached `.duckdb` file itself
+  as an implicit readable path even after `allowed_paths = []` and
+  `enable_external_access = false`: queries can see its path in
+  `duckdb_databases()` and read its raw file bytes in `MaxChars`-sized slices
+  via `read_blob` (including unprojected tables or free-list pages). Only attach
+  database files whose full contents agents are allowed to read.
 - `Open` sets `search_path` to `main,"<alias>".main,...` (and restores it if a
   pooled connection is ever recycled after a failed rollback). Both qualified
   (`ct.ct_brands`) and unqualified (`ct_brands`) references resolve without
@@ -127,12 +132,17 @@ func (db *DB) SetViews(ctx context.Context, views map[string]string) error
   `SELECT * FROM (\n<body>\n) AS ntduckbox_view`, and validates it with
   `Conn.Prepare` and `stmt.StatementType() == STATEMENT_TYPE_SELECT` before
   running `CREATE OR REPLACE VIEW main."<name>" AS SELECT * FROM (\n<body>\n) AS ntduckbox_view`
-  inside the transaction.
+  inside the transaction. Views in one `SetViews` map are created in dependency
+  passes so acyclic views may reference one another regardless of map key order;
+  cycles make no progress and roll back.
 - `SetParquetViews`, `SetCSVViews`, and `SetViews` each track their own managed
   view names and reject cross-set name collisions. Reloading `inventory` via
   `SetCSVViews` executes `CREATE OR REPLACE VIEW main."inventory"` in place;
-  `inventory_brands` (managed by `SetViews`) remains intact and immediately
-  queries the updated CSV without reopening the attached `.duckdb` file.
+  `inventory_brands` (managed by `SetViews`) is re-validated before commit and
+  immediately queries the updated CSV without reopening the attached `.duckdb`
+  file. Removing or altering a Parquet or CSV view in a way that invalidates a
+  remaining `SetViews` view fails and rolls back; clear `SetViews` first when
+  removing both.
 
 ## Threat-model argument and `AGENTS.md` amendment
 
@@ -152,7 +162,9 @@ expose a footgun that executes unvalidated batches or bypasses `AllowedDirs`.
 2. **Single-statement `SELECT` preparation:** `Conn.Prepare` on
    `SELECT * FROM (\n<body>\n) AS ntduckbox_view` rejects multi-statement
    batches before any prefix executes and rejects DDL, DML, `COPY`, `ATTACH`,
-   `LOAD`, `INSTALL`, `SET`, `PRAGMA`, and `query('...')`.
+   `LOAD`, `INSTALL`, `SET`, `PRAGMA`, and `query()` of a non-`SELECT`
+   statement (`query('SELECT ...')` is a normal `SELECT` and executes under the
+   same locked filesystem settings and read-only transaction).
 3. **No privilege elevation (`SECURITY INVOKER` semantics):** DuckDB views do
    not carry elevated permissions. Binding a view at `CREATE VIEW` time and
    querying it at `Query` time both run under the locked `allowed_directories`
@@ -163,9 +175,10 @@ expose a footgun that executes unvalidated batches or bypasses `AllowedDirs`.
    `TestAttachAndIsolation`, `TestSetCSVViews`, and
    `TestSetViewsAndDankBotWorkflow` verify via both the public API and direct
    `db.pool.Exec` assertions that:
-   - Untrusted SQL can read `ct_brands` from an attached `.duckdb` file while
-     sibling files (`secret.csv`, `other.duckdb`) in the same un-allowlisted
-     directory fail with `engineErrorPermission` (`Cannot access`).
+   - Untrusted SQL can read `ct_brands` (and raw bytes of the attached `.duckdb`
+     file itself, which DuckDB exempts from `enable_external_access = false`)
+     while sibling files (`secret.csv`, `other.duckdb`) and writes in the same
+     un-allowlisted directory fail with `engineErrorPermission` (`Cannot access`).
    - Writes to attached databases fail at the engine level with
      `engineErrorInvalidInput` (`read-only mode`).
    - Paths outside `AllowedDirs`, `..` traversals, and symlinks in `SetCSVViews`

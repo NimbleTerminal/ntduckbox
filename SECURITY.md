@@ -31,7 +31,8 @@ disclosing publicly.
 
 - SQL that writes to a file-backed or in-memory database.
 - SQL that changes any engine setting, or loads or installs an extension.
-- Reading a file outside the configured `AllowedDirs`, including through
+- Reading a file outside the configured `AllowedDirs` (other than a database
+  file explicitly attached through `Options.Attach`), including through
   traversal or symlinks, or any network access.
 - Executing more than one statement, or executing any statement before
   validation rejects a batch.

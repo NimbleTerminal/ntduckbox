@@ -514,15 +514,34 @@ func TestAttachAndIsolation(t *testing.T) {
 		t.Fatalf("unqualified query after bad-connection recovery: %q %v", got, err)
 	}
 
-	// Untrusted SQL cannot reach sibling files in baseDir that were not attached or allowlisted.
+	// DuckDB treats an attached database file as an implicit readable path even
+	// after allowed_paths is cleared and enable_external_access is false: its
+	// canonical path is visible in duckdb_databases() and its bytes are readable
+	// via read_blob. Sibling files and writes in the same directory remain denied.
+	canonicalBase, err := filepath.EvalSymlinks(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.Query(ctx, "SELECT database_name FROM duckdb_databases() WHERE path = "+literal(canonicalBase)); err != nil || got != "database_name\nct\n" {
+		t.Fatalf("duckdb_databases() attached path: %q %v", got, err)
+	}
+	if got, err := db.Query(ctx, "SELECT to_hex(content[9:12]) AS magic FROM read_blob("+literal(canonicalBase)+")"); err != nil || got != "magic\n4455434B\n" {
+		t.Fatalf("read_blob of attached database file: %q %v", got, err)
+	}
 	for _, q := range []string{
 		"SELECT * FROM read_csv(" + literal(secretCSV) + ")",
 		"SELECT * FROM read_text(" + literal(secretCSV) + ")",
+		"SELECT * FROM read_blob(" + literal(secretCSV) + ")",
+		"SELECT * FROM read_blob(" + literal(otherDB) + ")",
 		"SELECT * FROM glob(" + literal(filepath.Join(baseDir, "*")) + ")",
 	} {
 		_, err := db.Query(ctx, q)
 		assertEngineError(t, err, engineErrorPermission, "Cannot access")
 		_, err = db.pool.Exec(q)
+		assertEngineError(t, err, engineErrorPermission, "Cannot access")
+	}
+	for _, dest := range []string{basePath, secretCSV, filepath.Join(baseDir, "new.csv")} {
+		_, err := db.pool.Exec("COPY (SELECT 1) TO " + literal(dest))
 		assertEngineError(t, err, engineErrorPermission, "Cannot access")
 	}
 	if _, err := db.Query(ctx, "ATTACH "+literal(otherDB)+" AS other (READ_ONLY)"); err == nil || !strings.HasPrefix(err.Error(), "query rejected: ") {
@@ -735,17 +754,32 @@ func TestSetViewsAndDankBotWorkflow(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// Views in one SetViews map may reference each other even when the dependent
+	// view name ("a_top") sorts before its dependency ("inventory_brands").
 	if err := db.SetViews(ctx, map[string]string{
+		"a_top":            "SELECT item_id, registration_number, price FROM inventory_brands",
 		"inventory_brands": inventoryBrandsSQL,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := db.Query(ctx, "SELECT item_id, registration_number, producer, price FROM inventory_brands"); err != nil || got != "item_id,registration_number,producer,price\ni1,RN-100,Acme Growers,31.5\n" {
-		t.Fatalf("inventory_brands initial: %q %v", got, err)
+	if got, err := db.Query(ctx, "SELECT item_id, registration_number, price FROM a_top"); err != nil || got != "item_id,registration_number,price\ni1,RN-100,31.5\n" {
+		t.Fatalf("a_top initial: %q %v", got, err)
 	}
 
-	// R4: Reloading the CSV view in place updates inventory_brands without
-	// reopening the base database or re-running SetViews.
+	// Updating both views in one call rebinds against the new dependency schema,
+	// and cyclic dependencies fail and roll back.
+	if err := db.SetViews(ctx, map[string]string{
+		"a": "SELECT * FROM b",
+		"b": "SELECT * FROM a",
+	}); err == nil {
+		t.Fatal("cyclic views accepted")
+	}
+	if got, err := db.Query(ctx, "SELECT item_id, registration_number, price FROM a_top"); err != nil || got != "item_id,registration_number,price\ni1,RN-100,31.5\n" {
+		t.Fatalf("a_top after rejected cycle: %q %v", got, err)
+	}
+
+	// R4: Reloading the CSV view in place updates inventory_brands and a_top
+	// without reopening the base database or re-running SetViews.
 	if err := db.SetCSVViews(ctx, map[string]CSVView{
 		"inventory": {Path: inv2, Columns: cols},
 	}); err != nil {
@@ -753,6 +787,17 @@ func TestSetViewsAndDankBotWorkflow(t *testing.T) {
 	}
 	if got, err := db.Query(ctx, "SELECT item_id, registration_number, producer, price FROM inventory_brands"); err != nil || got != "item_id,registration_number,producer,price\ni2,RN-200,North Farms,40.0\n" {
 		t.Fatalf("inventory_brands after CSV swap: %q %v", got, err)
+	}
+	if got, err := db.Query(ctx, "SELECT item_id, registration_number, price FROM a_top"); err != nil || got != "item_id,registration_number,price\ni2,RN-200,40.0\n" {
+		t.Fatalf("a_top after CSV swap: %q %v", got, err)
+	}
+
+	// Dropping a CSV view while a SQL view still depends on it fails and rolls back.
+	if err := db.SetCSVViews(ctx, nil); err == nil || !strings.Contains(err.Error(), "invalidated") {
+		t.Fatalf("expected dependent SQL view invalidation error, got %v", err)
+	}
+	if got, err := db.Query(ctx, "SELECT item_id, registration_number FROM inventory_brands"); err != nil || got != "item_id,registration_number\ni2,RN-200\n" {
+		t.Fatalf("inventory_brands after rejected CSV drop: %q %v", got, err)
 	}
 
 	// Cross-set name collisions are rejected before touching existing views.

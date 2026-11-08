@@ -291,13 +291,14 @@ func validateCSVHeader(ctx context.Context, conn *sql.Conn, name string, v CSVVi
 
 // SetViews replaces the host-defined SQL views of an in-memory database. Keys
 // are view names in the main schema; values are single SELECT or WITH...SELECT
-// query bodies (without CREATE VIEW). Each body is wrapped as a subquery and
-// validated with DuckDB's single-statement Prepare API before execution, then
-// bound by the engine under the locked configuration. SQL views from earlier
-// calls that are absent from views are dropped; views managed by
-// SetParquetViews or SetCSVViews are untouched. Any non-SELECT statement,
-// batch, or disallowed file access fails the call and leaves the previous set
-// in place. File-backed databases return an error.
+// query bodies (without CREATE VIEW). Views in the same map may reference one
+// another in any acyclic order; cycles are rejected. Each body is wrapped as a
+// subquery and validated with DuckDB's single-statement Prepare API before
+// execution, then bound by the engine under the locked configuration. SQL
+// views from earlier calls that are absent from views are dropped; views
+// managed by SetParquetViews or SetCSVViews are untouched. Any non-SELECT
+// statement, batch, cycle, or disallowed file access fails the call and leaves
+// the previous set in place. File-backed databases return an error.
 func (db *DB) SetViews(ctx context.Context, views map[string]string) error {
 	cleaned := make(map[string]string, len(views))
 	for name, query := range views {
@@ -327,10 +328,6 @@ func (db *DB) replaceViews(ctx context.Context, kind viewKind, names []string, b
 			return fmt.Errorf("view %q is already managed by another view set", name)
 		}
 	}
-	keep := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		keep[name] = struct{}{}
-	}
 	ctx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
 	defer cancel()
 	conn, err := db.conn(ctx)
@@ -342,25 +339,72 @@ func (db *DB) replaceViews(ctx context.Context, kind viewKind, names []string, b
 		return err
 	}
 	apply := func() error {
-		for _, name := range slices.Sorted(maps.Keys(db.views)) {
-			if db.views[name] != kind {
-				continue
+		created := make([]string, 0, len(names))
+		createdSQL := make(map[string]string, len(names))
+		resetTx := func() error {
+			for _, name := range slices.Sorted(maps.Keys(db.views)) {
+				if db.views[name] != kind {
+					continue
+				}
+				if _, err := conn.ExecContext(ctx, "DROP VIEW IF EXISTS main."+identifier(name)); err != nil {
+					return err
+				}
 			}
-			if _, ok := keep[name]; ok {
-				continue
+			for _, name := range created {
+				stmt := "CREATE OR REPLACE VIEW main." + identifier(name) + " AS " + createdSQL[name]
+				if _, err := conn.ExecContext(ctx, stmt); err != nil {
+					return err
+				}
 			}
-			if _, err := conn.ExecContext(ctx, "DROP VIEW IF EXISTS main."+identifier(name)); err != nil {
-				return err
-			}
+			return nil
 		}
-		for _, name := range names {
-			selectSQL, err := build(ctx, conn, name)
-			if err != nil {
-				return err
+		if err := resetTx(); err != nil {
+			return err
+		}
+		pending := names
+		for len(pending) > 0 {
+			var next []string
+			var firstErr error
+			progressed := false
+			for _, name := range pending {
+				selectSQL, err := build(ctx, conn, name)
+				if err == nil {
+					stmt := "CREATE OR REPLACE VIEW main." + identifier(name) + " AS " + selectSQL
+					_, err = conn.ExecContext(ctx, stmt)
+				}
+				if err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					next = append(next, name)
+					// A failed Prepare or CREATE VIEW marks the DuckDB transaction
+					// as aborted; roll back and replay the known-good prefix.
+					db.rollback(conn)
+					if _, rbErr := conn.ExecContext(ctx, "BEGIN TRANSACTION"); rbErr != nil {
+						return firstErr
+					}
+					if rbErr := resetTx(); rbErr != nil {
+						return firstErr
+					}
+					continue
+				}
+				created = append(created, name)
+				createdSQL[name] = selectSQL
+				progressed = true
 			}
-			stmt := "CREATE OR REPLACE VIEW main." + identifier(name) + " AS " + selectSQL
-			if _, err := conn.ExecContext(ctx, stmt); err != nil {
-				return err
+			if !progressed {
+				return firstErr
+			}
+			pending = next
+		}
+		if kind != viewSQL {
+			for _, name := range slices.Sorted(maps.Keys(db.views)) {
+				if db.views[name] != viewSQL {
+					continue
+				}
+				if err := validateSelect(conn, "SELECT * FROM main."+identifier(name)); err != nil {
+					return fmt.Errorf("view %s invalidated: %w", name, err)
+				}
 			}
 		}
 		_, err := conn.ExecContext(ctx, "COMMIT")

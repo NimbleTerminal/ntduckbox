@@ -266,13 +266,16 @@ managed set: views from earlier calls to the same method that are missing from
 the map are dropped, an empty map drops them all, and views managed by the other
 methods are untouched. `SetParquetViews` and `SetCSVViews` quote names, paths,
 and column definitions themselves; `SetViews` wraps each query body as a
-subquery and validates it with DuckDB's single-statement `Prepare` API
-(`STATEMENT_TYPE_SELECT`) before creating the view. The engine binds every view
-under the locked settings, so a path outside `AllowedDirs`, a header mismatch,
-or a non-SELECT statement fails the call and leaves the previous set in place.
-File-backed primary databases are opened read-only and reject all three methods.
-See [docs/host-views.md](docs/host-views.md) for the design and threat-model
-analysis.
+subquery, validates it with DuckDB's single-statement `Prepare` API
+(`STATEMENT_TYPE_SELECT`), and creates views in dependency passes so acyclic
+views in one map may reference each other regardless of map key order. Removing
+or changing a Parquet or CSV view that a remaining `SetViews` view depends on
+fails and rolls back; clear `SetViews` first when tearing down both. The engine
+binds every view under the locked settings, so a path outside `AllowedDirs`, a
+header mismatch, a cycle, or a non-SELECT statement fails the call and leaves
+the previous set in place. File-backed primary databases are opened read-only
+and reject all three methods. See [docs/host-views.md](docs/host-views.md) for
+the design and threat-model analysis.
 
 ## Security considerations
 
@@ -311,10 +314,18 @@ views, SELECT expressions, and allowlisted local file readers remain available.
 
 Within this threat model: no SQL writes, no extension loading, no user
 configuration changes, no network reads, and no external file reads outside the
-explicit allowlist. With no allowlist, queries use only the opened database and
-built-in SQL functionality. All data within an allowed directory is readable;
-there is no per-table or per-file authorization layer. The engine also permits
-writes inside an allowed directory: only the SELECT-only statement check stops
+explicit allowlist and any attached database files. With no allowlist, queries
+use only the opened or attached databases and built-in SQL functionality.
+DuckDB treats each `Options.Attach` database file as an implicit readable path
+even after `allowed_paths = []` and `enable_external_access = false`: queries
+can discover its absolute path via `duckdb_databases()` and read the raw
+database file bytes via `read_blob` (including unprojected tables or free-list
+pages, in `MaxChars`-sized slices), while sibling files and writes in that
+directory remain denied. Attach only database files whose full contents agents
+may read, and vacuum or repack them beforehand if deleted data must not be
+recoverable. All data within an allowed directory is likewise readable; there is
+no per-table or per-file authorization layer. The engine also permits writes
+inside an allowed directory: only the SELECT-only statement check stops
 `COPY ... TO` from landing there. Allowlist directories that hold nothing but the
 data agents should see, and that can tolerate being written to if that check were
 ever bypassed. Query results are untrusted data and may contain prompt injection
