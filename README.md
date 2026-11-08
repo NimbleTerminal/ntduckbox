@@ -86,7 +86,12 @@ func run() error {
 ## Results and lifecycle
 
 The caller owns the DB and must close it. Calls may run concurrently; each DB
-serializes queries through one connection, and waiting counts toward the timeout.
+uses a single pooled connection (`SetMaxOpenConns(1)`) so DuckDB catalog state
+and settings remain consistent, and `QueryTimeout` starts before acquiring that
+connection. Under heavy concurrency, later callers wait in `sql.DB`'s connection
+queue and can exhaust their `QueryTimeout` before their SQL runs; hosts that fan
+out many concurrent requests should enforce admission control (such as a bounded
+semaphore) in front of `QueryWith` if they prefer fast rejection over queueing.
 Pass a context to cancel a request earlier than the host-configured deadline.
 
 Zero limits select the defaults shown above; negatives are errors. `MaxRows`
@@ -94,6 +99,10 @@ must not exceed `math.MaxInt-1`, leaving room to fetch one extra row. CSV is the
 default format. `QueryFormat(ctx, sql, ntduckbox.Markdown)` selects a format for
 one call: `CSV`, `Markdown`, `JSONRows`, or `JSONColumnar` (see `Formats`). `Describe(ctx, sql)` returns a query schema;
 `DescribeTable(ctx, "main", "events")` quotes each identifier component safely.
+For structured Go introspection without parsing formatted text, `Columns(ctx, "main", "events")`
+returns `[]Column{Name, Type}` for a table or view, and `Views(ctx)` returns
+`[]ViewInfo{Name, Kind, Source}` (`ParquetViewKind`, `CSVViewKind`, or
+`SQLViewKind`) for the host-defined views registered on an in-memory DB.
 
 CSV and Markdown include headers. DuckDB casts every value to VARCHAR before
 encoding, so dates, timestamps, intervals, lists, structs, and blobs use DuckDB's
@@ -116,14 +125,34 @@ either limit return `ErrResultLimit` with no partial output. Add a SQL `LIMIT`
 or select fewer columns. Trailing semicolons are ignored.
 
 `QueryWith(ctx, sql, ntduckbox.QueryOptions{...})` adjusts one call and returns
-a `Result` with the text, the number of data rows, and a `Truncated` flag.
-`MaxRows` lowers the row cap for that call; the host limit from Open stays the
-ceiling and a larger value is an error. `Truncate` returns the rows that fit
-instead of `ErrResultLimit` and sets `Truncated`, so a host can tell its caller
-that more rows exist. CSV and Markdown stop at the last whole row within both
-limits; JSON formats stop at `MaxRows` rows, but a JSON result over `MaxChars`
-is still an error. Every query asks the engine for at most one row past the cap,
-so oversized results are not materialized.
+a `Result` with `Text`, `Rows` (data rows), `Bytes` (`len(Text)`), `Truncated`,
+and `Elapsed` (wall time inside `QueryWith`, including connection wait).
+`MaxRows` and `MaxChars` lower the row and byte caps for that call; the host
+limits from `Open` stay the ceiling and larger values are errors. `Truncate`
+returns the whole rows that fit within both `MaxRows` and `MaxChars` instead of
+`ErrResultLimit` and sets `Truncated`, so a host can tell its caller that more
+rows exist. CSV and Markdown stop at the last whole row within both limits;
+`JSONRows` and `JSONColumnar` re-run `to_json` with a smaller row cap when the
+initial page exceeds `MaxChars`. If not even a single row (or header) fits
+within `MaxChars`, `ErrResultLimit` is still returned. Every query asks the
+engine for at most one row past the cap, so oversized results are not
+materialized.
+
+`Validate(ctx, sql)` runs the same subquery wrapper and single-statement
+`Conn.Prepare` check as `QueryWith` inside a read-only transaction without
+executing rows. Both `Validate` and `QueryWith` wrap rejected queries with
+sentinel errors so callers can branch with `errors.Is`:
+
+- `ErrNotSelect`: empty query, multi-statement batch, or non-`SELECT` statement
+  (DDL, DML, `COPY`, `ATTACH`, `DETACH`, `LOAD`, `INSTALL`, `SET`, `RESET`,
+  `PRAGMA`, `CALL`, `EXPORT`, `IMPORT`).
+- `ErrPermission`: access denied by `allowed_directories`, `enable_external_access=false`,
+  `disabled_filesystems`, or `lock_configuration=true` (including `read_parquet`,
+  `read_csv`, `read_blob`, `read_text`, `glob`, and single- or double-quoted file
+  paths in `FROM` outside `AllowedDirs`).
+- `ErrBinder`: syntax, catalog, or binder error inside a `SELECT` query (such as
+  an unknown table or column, a type mismatch, or `query('...')` of a non-`SELECT`
+  statement).
 
 An empty Path or `:memory:` creates an empty in-memory database. DuckDB does not
 support opening an in-memory database with `access_mode=read_only`; internally
@@ -261,21 +290,35 @@ err = db.SetViews(ctx, map[string]string{
 })
 ```
 
-Each `SetParquetViews`, `SetCSVViews`, or `SetViews` call replaces its own
+When a host layers derived SQL views on top of Parquet or CSV views and refreshes
+them together, `SetAllViews(ctx, ntduckbox.ViewSet{Parquet: ..., CSV: ..., SQL: ...})`
+replaces all three kinds in a single transaction so base views and their
+dependent SQL views can be added, updated, or dropped atomically. Each standalone
+`SetParquetViews`, `SetCSVViews`, or `SetViews` call replaces only its own
 managed set: views from earlier calls to the same method that are missing from
 the map are dropped, an empty map drops them all, and views managed by the other
-methods are untouched. `SetParquetViews` and `SetCSVViews` quote names, paths,
-and column definitions themselves; `SetViews` wraps each query body as a
-subquery, validates it with DuckDB's single-statement `Prepare` API
-(`STATEMENT_TYPE_SELECT`), and creates views in dependency passes so acyclic
-views in one map may reference each other regardless of map key order. Removing
-or changing a Parquet or CSV view that a remaining `SetViews` view depends on
-fails and rolls back; clear `SetViews` first when tearing down both. The engine
-binds every view under the locked settings, so a path outside `AllowedDirs`, a
-header mismatch, a cycle, or a non-SELECT statement fails the call and leaves
-the previous set in place. File-backed primary databases are opened read-only
-and reject all three methods. See [docs/host-views.md](docs/host-views.md) for
-the design and threat-model analysis.
+methods are untouched. Removing or changing a Parquet or CSV view via a
+standalone call when a remaining `SetViews` view still depends on it fails,
+enumerates every invalidated SQL view in the error, and rolls back; use
+`SetAllViews` when updating base and derived views together.
+
+`SetParquetViews` and `SetCSVViews` quote names, paths, and column definitions
+themselves; `SetViews` wraps each query body as a subquery, validates it with
+DuckDB's single-statement `Prepare` API (`STATEMENT_TYPE_SELECT`), and creates
+views in dependency passes so acyclic views in one map may reference each other
+regardless of map key order. Small host-provided metadata tables (such as cache
+manifests) can also be exposed as `VALUES`-backed views in `SetViews` without
+writing a sidecar file (`SELECT * FROM (VALUES (...)) AS t(...)`). A Parquet
+glob that matches zero files fails at `SetParquetViews` / `SetAllViews` time and
+rolls back; if all matching files are removed from disk after the view is
+created, the view remains in the catalog (`Views` still lists it) and queries
+against it fail until matching files exist again or the view is dropped. The
+engine binds every view under the locked settings, so a path outside
+`AllowedDirs`, a header mismatch, a cycle, or a non-SELECT statement fails the
+call and leaves the previous set in place. File-backed primary databases are
+opened read-only and reject view updates. See [docs/host-views.md](docs/host-views.md)
+for the design, threat-model analysis, nanosecond timestamp (`TIMESTAMPTZ_NS`)
+handling, and `VALUES`-view patterns.
 
 ## Security considerations
 
@@ -300,17 +343,26 @@ Before returning a DB, Open configures:
 
 There is no user SQL during initialization. Every setting must succeed. DuckDB
 requires attachments and the allowlist to be configured before disabling external
-access. `SetParquetViews`, `SetCSVViews`, and `SetViews` are the only host-side
-catalog changes; they run after the lock on in-memory databases only, cannot
-touch settings or file-backed databases, and are never exposed through MCP.
+access. `SetParquetViews`, `SetCSVViews`, `SetViews`, and `SetAllViews` are the
+only host-side catalog changes; they run after the lock on in-memory databases
+only, cannot touch settings or file-backed databases, and are never exposed
+through MCP.
 
 Public queries are wrapped as SELECT subqueries whose columns are cast to VARCHAR,
 then checked with DuckDB's native single-statement preparation API before execution. This is deliberately not a
-keyword/regex SQL filter. Batches are rejected before any batch prefix executes.
-Commands such as LOAD, INSTALL, ATTACH, COPY, DDL, DML, SET, and PRAGMA cannot pass
-this boundary. Each query also runs in a read-only transaction, rolled back on
-completion, blocking mutating expressions such as `nextval`. Existing tables and
-views, SELECT expressions, and allowlisted local file readers remain available.
+keyword/regex SQL filter; hosts do not need a regex allowlist in front of
+`ntduckbox`. Batches are rejected before any batch prefix executes. Commands
+such as `LOAD`, `INSTALL`, `ATTACH`, `DETACH`, `COPY`, DDL (`CREATE`, `ALTER`,
+`DROP`), DML (`INSERT`, `UPDATE`, `DELETE`, `MERGE`), `SET`, `RESET`, `PRAGMA`,
+`CALL`, `EXPORT`, and `IMPORT` fail inside the subquery wrapper at `Prepare`
+time (`ErrNotSelect`), and `query('...')` of a non-`SELECT` statement fails at
+bind time (`ErrBinder`). File readers (`read_parquet`, `parquet_scan`,
+`read_csv`, `read_blob`, `read_text`, `glob`) and single- or double-quoted file
+paths in `FROM` (`FROM '/outside/x.parquet'`, `FROM "/outside/x.parquet"`)
+outside `AllowedDirs` fail at bind time with `ErrPermission`. Each query also
+runs in a read-only transaction, rolled back on completion, blocking mutating
+expressions such as `nextval`. Existing tables and views, SELECT expressions,
+and allowlisted local file readers remain available.
 
 Within this threat model: no SQL writes, no extension loading, no user
 configuration changes, no network reads, and no external file reads outside the

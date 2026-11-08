@@ -3,10 +3,12 @@ package ntduckbox
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1020,20 +1022,473 @@ func TestQueryWith(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// JSON formats truncate by rows, keep order, and still error on characters.
+	// JSON formats truncate by rows or characters, keep order, and still error
+	// when not even one row fits within MaxChars.
 	res, err = db.QueryWith(ctx, three, QueryOptions{MaxRows: 2, Truncate: true, Format: JSONRows})
-	if err != nil || res.Text != `[{"i":0},{"i":1}]` || res.Rows != 2 || !res.Truncated {
+	if err != nil || res.Text != `[{"i":0},{"i":1}]` || res.Rows != 2 || !res.Truncated || res.Bytes != len(res.Text) || res.Elapsed <= 0 {
 		t.Fatalf("%#v %v", res, err)
 	}
 	res, err = db.QueryWith(ctx, three, QueryOptions{MaxRows: 2, Truncate: true, Format: JSONColumnar})
-	if err != nil || res.Text != `{"i":[0,1]}` || res.Rows != 2 || !res.Truncated {
+	if err != nil || res.Text != `{"i":[0,1]}` || res.Rows != 2 || !res.Truncated || res.Bytes != len(res.Text) || res.Elapsed <= 0 {
 		t.Fatalf("%#v %v", res, err)
 	}
 	res, err = db.QueryWith(ctx, three, QueryOptions{Format: JSONRows})
-	if err != nil || res.Rows != 3 || res.Truncated {
+	if err != nil || res.Rows != 3 || res.Truncated || res.Bytes != len(res.Text) || res.Elapsed <= 0 {
 		t.Fatalf("%#v %v", res, err)
 	}
 	if _, err := db.QueryWith(ctx, "SELECT repeat('x', 70) AS s", QueryOptions{Truncate: true, Format: JSONRows}); !errors.Is(err, ErrResultLimit) {
 		t.Fatal(err)
+	}
+	if _, err := db.QueryWith(ctx, "SELECT repeat('x', 70) AS s", QueryOptions{Truncate: true, Format: JSONColumnar}); !errors.Is(err, ErrResultLimit) {
+		t.Fatal(err)
+	}
+
+	// Per-call MaxChars cap below the host ceiling, with and without Truncate.
+	if _, err := db.QueryWith(ctx, three, QueryOptions{MaxChars: 61}); err == nil || errors.Is(err, ErrResultLimit) {
+		t.Fatalf("MaxChars above host limit: %v", err)
+	}
+	if _, err := db.QueryWith(ctx, three, QueryOptions{MaxChars: -1}); err == nil {
+		t.Fatal("negative MaxChars accepted")
+	}
+	if _, err := db.QueryWith(ctx, three, QueryOptions{MaxChars: 6}); !errors.Is(err, ErrResultLimit) {
+		t.Fatalf("MaxChars without Truncate: %v", err)
+	}
+	res, err = db.QueryWith(ctx, three, QueryOptions{MaxChars: 6, Truncate: true})
+	if err != nil || res.Text != "i\n0\n1\n" || res.Rows != 2 || !res.Truncated || res.Bytes != 6 {
+		t.Fatalf("CSV MaxChars truncate: %#v %v", res, err)
+	}
+	// JSONRows for 3 rows is `[{"i":0},{"i":1},{"i":2}]` (25 bytes); MaxChars: 18 fits 2 rows (`[{"i":0},{"i":1}]`, 17 bytes).
+	res, err = db.QueryWith(ctx, three, QueryOptions{MaxChars: 18, Truncate: true, Format: JSONRows})
+	if err != nil || res.Text != `[{"i":0},{"i":1}]` || res.Rows != 2 || !res.Truncated || res.Bytes != 17 {
+		t.Fatalf("JSONRows MaxChars truncate: %#v %v", res, err)
+	}
+	var parsedRows []map[string]int
+	if err := json.Unmarshal([]byte(res.Text), &parsedRows); err != nil || len(parsedRows) != 2 {
+		t.Fatalf("JSONRows unmarshal: %v %v", parsedRows, err)
+	}
+	// JSONColumnar for 3 rows is `{"i":[0,1,2]}` (13 bytes); MaxChars: 11 fits 2 rows (`{"i":[0,1]}`, 11 bytes).
+	res, err = db.QueryWith(ctx, three, QueryOptions{MaxChars: 11, Truncate: true, Format: JSONColumnar})
+	if err != nil || res.Text != `{"i":[0,1]}` || res.Rows != 2 || !res.Truncated || res.Bytes != 11 {
+		t.Fatalf("JSONColumnar MaxChars truncate: %#v %v", res, err)
+	}
+}
+
+func TestSetAllViewsAndInvalidation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	tradesParquet := filepath.Join(dir, "trades.parquet")
+	bboParquet := filepath.Join(dir, "bbo.parquet")
+	metaCSV := filepath.Join(dir, "meta.csv")
+	if err := os.WriteFile(metaCSV, []byte("symbol,venue\nAAPL,XNAS\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		"COPY (SELECT 'AAPL' AS symbol, 100 AS price) TO " + literal(tradesParquet) + " (FORMAT PARQUET)",
+		"COPY (SELECT 'AAPL' AS symbol, 99 AS bid, 101 AS ask) TO " + literal(bboParquet) + " (FORMAT PARQUET)",
+	} {
+		if _, err := seed.Exec(stmt); err != nil {
+			seed.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openTest(t, Options{Path: ":memory:", AllowedDirs: []string{dir}})
+
+	// SetAllViews creates Parquet, CSV, and derived SQL views in one transaction.
+	err = db.SetAllViews(ctx, ViewSet{
+		Parquet: map[string]string{
+			"XNAS.ITCH/trades": tradesParquet,
+			"EQUS.MINI/bbo":    bboParquet,
+		},
+		CSV: map[string]CSVView{
+			"meta": {Path: metaCSV, Columns: []Column{{Name: "symbol", Type: "VARCHAR"}, {Name: "venue", Type: "VARCHAR"}}},
+		},
+		SQL: map[string]string{
+			"trades_enriched": `SELECT t.symbol, t.price, m.venue FROM "XNAS.ITCH/trades" t JOIN meta m USING (symbol)`,
+			"bbo_spread":      `SELECT symbol, ask - bid AS spread FROM "EQUS.MINI/bbo"`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.Query(ctx, "SELECT symbol, price, venue FROM trades_enriched"); err != nil || got != "symbol,price,venue\nAAPL,100,XNAS\n" {
+		t.Fatalf("trades_enriched: %q %v", got, err)
+	}
+	if got, err := db.Query(ctx, "SELECT symbol, spread FROM bbo_spread"); err != nil || got != "symbol,spread\nAAPL,2\n" {
+		t.Fatalf("bbo_spread: %q %v", got, err)
+	}
+
+	// Standalone SetParquetViews dropping both Parquet views enumerates all broken SQL views.
+	err = db.SetParquetViews(ctx, nil)
+	if err == nil || !strings.Contains(err.Error(), "bbo_spread") || !strings.Contains(err.Error(), "trades_enriched") {
+		t.Fatalf("expected both broken SQL views in error, got %v", err)
+	}
+	if !errors.Is(err, ErrBinder) {
+		t.Fatalf("expected ErrBinder in invalidation error, got %v", err)
+	}
+
+	// SetAllViews atomically drops a base Parquet view and its dependent SQL view together.
+	err = db.SetAllViews(ctx, ViewSet{
+		Parquet: map[string]string{
+			"XNAS.ITCH/trades": tradesParquet,
+		},
+		CSV: map[string]CSVView{
+			"meta": {Path: metaCSV, Columns: []Column{{Name: "symbol", Type: "VARCHAR"}, {Name: "venue", Type: "VARCHAR"}}},
+		},
+		SQL: map[string]string{
+			"trades_enriched": `SELECT t.symbol, t.price, m.venue FROM "XNAS.ITCH/trades" t JOIN meta m USING (symbol)`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Query(ctx, "SELECT * FROM bbo_spread"); !errors.Is(err, ErrBinder) {
+		t.Fatalf("expected dropped bbo_spread to fail with ErrBinder, got %v", err)
+	}
+
+	// Duplicate view names across kinds in ViewSet fail without damaging existing views.
+	err = db.SetAllViews(ctx, ViewSet{
+		Parquet: map[string]string{"dup": tradesParquet},
+		SQL:     map[string]string{"dup": "SELECT 1"},
+	})
+	if err == nil {
+		t.Fatal("duplicate view name across kinds accepted")
+	}
+	if got, err := db.Query(ctx, "SELECT symbol, price, venue FROM trades_enriched"); err != nil || got != "symbol,price,venue\nAAPL,100,XNAS\n" {
+		t.Fatalf("trades_enriched after rejected SetAllViews: %q %v", got, err)
+	}
+
+	// Empty glob at view creation fails and rolls back; removing files after
+	// creation leaves the view in the catalog and fails when queried.
+	globDir := filepath.Join(dir, "glob")
+	if err := os.MkdirAll(globDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	globPattern := filepath.Join(globDir, "*.parquet")
+	if err := db.SetParquetViews(ctx, map[string]string{"empty_glob": globPattern}); err == nil {
+		t.Fatal("empty Parquet glob accepted at creation")
+	}
+	globFile := filepath.Join(globDir, "part0.parquet")
+	raw, err := os.ReadFile(tradesParquet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(globFile, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetAllViews(ctx, ViewSet{
+		Parquet: map[string]string{"live_glob": globPattern},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(globFile); err != nil {
+		t.Fatal(err)
+	}
+	views, err := db.Views(ctx)
+	if err != nil || len(views) != 1 || views[0].Name != "live_glob" {
+		t.Fatalf("expected live_glob to remain registered after file removal, got %v %v", views, err)
+	}
+	if _, err := db.Query(ctx, "SELECT * FROM live_glob"); err == nil {
+		t.Fatal("querying Parquet glob after all files removed succeeded")
+	}
+}
+
+func TestValidateAndSentinelErrors(t *testing.T) {
+	ctx := context.Background()
+	allowedDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outsideParquet := filepath.Join(outsideDir, "secret.parquet")
+	outsideCSV := filepath.Join(outsideDir, "secret.csv")
+	if err := os.WriteFile(outsideCSV, []byte("a\n1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Exec("COPY (SELECT 1 AS a) TO " + literal(outsideParquet) + " (FORMAT PARQUET)"); err != nil {
+		seed.Close()
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openTest(t, Options{Path: ":memory:", AllowedDirs: []string{allowedDir}})
+	if err := db.SetViews(ctx, map[string]string{"v": "SELECT 1 AS n"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, valid := range []string{
+		"SELECT n FROM v",
+		"WITH c AS (SELECT n FROM v) SELECT * FROM c;",
+		"VALUES (1, 'a'), (2, 'b')",
+		"FROM v",
+		"-- leading comment\n/* block */ (SELECT n FROM v)",
+	} {
+		if err := db.Validate(ctx, valid); err != nil {
+			t.Fatalf("Validate(%q) failed: %v", valid, err)
+		}
+	}
+
+	for _, notSelect := range []string{
+		"",
+		"   ; ; ",
+		"CREATE TABLE t(x INT)",
+		"INSERT INTO v VALUES (2)",
+		"UPDATE v SET n = 2",
+		"DELETE FROM v",
+		"DROP VIEW v",
+		"COPY v TO 'out.parquet'",
+		"ATTACH ':memory:' AS other",
+		"DETACH main",
+		"LOAD httpfs",
+		"INSTALL httpfs",
+		"SET enable_external_access = true",
+		"RESET enable_external_access",
+		"PRAGMA version",
+		"CALL duckdb_tables()",
+		"EXPORT DATABASE 'out'",
+		"IMPORT DATABASE 'out'",
+		"SELECT 1; SELECT 2",
+		"SELECT 1; DROP VIEW v",
+		"SELECT 1); DROP VIEW v; SELECT * FROM (SELECT 2",
+	} {
+		for _, err := range []error{
+			db.Validate(ctx, notSelect),
+			func() error { _, err := db.Query(ctx, notSelect); return err }(),
+		} {
+			if !errors.Is(err, ErrNotSelect) {
+				t.Fatalf("query %q: expected ErrNotSelect, got %v", notSelect, err)
+			}
+		}
+	}
+
+	for _, permQuery := range []string{
+		"SELECT * FROM read_parquet(" + literal(outsideParquet) + ")",
+		"SELECT * FROM parquet_scan(" + literal(outsideParquet) + ")",
+		"SELECT * FROM read_csv(" + literal(outsideCSV) + ")",
+		"SELECT * FROM read_blob(" + literal(outsideCSV) + ")",
+		"SELECT * FROM read_text(" + literal(outsideCSV) + ")",
+		"SELECT * FROM glob(" + literal(filepath.Join(outsideDir, "*")) + ")",
+		"SELECT * FROM " + literal(outsideParquet),
+		"SELECT * FROM " + identifier(outsideParquet),
+		"SELECT * FROM " + literal(outsideCSV),
+		"SELECT * FROM " + identifier(outsideCSV),
+	} {
+		for _, err := range []error{
+			db.Validate(ctx, permQuery),
+			func() error { _, err := db.Query(ctx, permQuery); return err }(),
+		} {
+			if !errors.Is(err, ErrPermission) {
+				t.Fatalf("query %q: expected ErrPermission, got %v", permQuery, err)
+			}
+		}
+	}
+
+	for _, binderQuery := range []string{
+		"SELECT * FROM missing_table",
+		"SELECT missing_col FROM v",
+		"SELECT 1 FROM",
+		"SELECT * FROM query('DELETE FROM v')",
+	} {
+		for _, err := range []error{
+			db.Validate(ctx, binderQuery),
+			func() error { _, err := db.Query(ctx, binderQuery); return err }(),
+		} {
+			if !errors.Is(err, ErrBinder) {
+				t.Fatalf("query %q: expected ErrBinder, got %v", binderQuery, err)
+			}
+		}
+	}
+}
+
+func TestColumnsAndViews(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	pqPath := filepath.Join(dir, "trades.parquet")
+	csvPath := filepath.Join(dir, "items.csv")
+	if err := os.WriteFile(csvPath, []byte("id,price\ni1,12.5\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Exec("COPY (SELECT 'AAPL' AS symbol, 42::BIGINT AS size) TO " + literal(pqPath) + " (FORMAT PARQUET)"); err != nil {
+		seed.Close()
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openTest(t, Options{Path: ":memory:", AllowedDirs: []string{dir}})
+	sqlBody := `SELECT symbol, size FROM "XNAS.ITCH/trades"`
+	if err := db.SetAllViews(ctx, ViewSet{
+		Parquet: map[string]string{"XNAS.ITCH/trades": pqPath},
+		CSV: map[string]CSVView{
+			"items": {Path: csvPath, Columns: []Column{{Name: "id", Type: "VARCHAR"}, {Name: "price", Type: "DOUBLE"}}},
+		},
+		SQL: map[string]string{"derived": sqlBody},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	gotViews, err := db.Views(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantViews := []ViewInfo{
+		{Name: "XNAS.ITCH/trades", Kind: ParquetViewKind, Source: pqPath},
+		{Name: "derived", Kind: SQLViewKind, Source: sqlBody},
+		{Name: "items", Kind: CSVViewKind, Source: csvPath},
+	}
+	if !slices.Equal(gotViews, wantViews) {
+		t.Fatalf("Views() = %#v, want %#v", gotViews, wantViews)
+	}
+
+	gotCols, err := db.Columns(ctx, "XNAS.ITCH/trades")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCols := []Column{{Name: "symbol", Type: "VARCHAR"}, {Name: "size", Type: "BIGINT"}}
+	if !slices.Equal(gotCols, wantCols) {
+		t.Fatalf("Columns(XNAS.ITCH/trades) = %#v, want %#v", gotCols, wantCols)
+	}
+
+	gotCSVCols, err := db.Columns(ctx, "main", "items")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCSVCols := []Column{{Name: "id", Type: "VARCHAR"}, {Name: "price", Type: "DOUBLE"}}
+	if !slices.Equal(gotCSVCols, wantCSVCols) {
+		t.Fatalf("Columns(main, items) = %#v, want %#v", gotCSVCols, wantCSVCols)
+	}
+
+	if _, err := db.Columns(ctx); err == nil {
+		t.Fatal("Columns() with no args accepted")
+	}
+	if _, err := db.Columns(ctx, ""); err == nil {
+		t.Fatal("Columns(\"\") accepted")
+	}
+	if _, err := db.Columns(ctx, "nonexistent"); !errors.Is(err, ErrBinder) {
+		t.Fatalf("Columns(nonexistent): expected ErrBinder, got %v", err)
+	}
+}
+
+func TestValuesMetadataAndNanosecondTimestamps(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	pqPath := filepath.Join(dir, "bbo.parquet")
+	seed, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// TIMESTAMP_NS is supported by both DuckDB 2.0 and Haybarn 1.5.x;
+	// TIMESTAMPTZ_NS is additionally tested below when Engine == "duckdb".
+	_, err = seed.Exec(`COPY (
+		SELECT
+			'EQUS.MINI' AS dataset,
+			'AAPL' AS symbol,
+			make_timestamp_ns(1700000000123456789) AS ts_event,
+			9223372036.85::DOUBLE AS ask_px
+		UNION ALL
+		SELECT
+			'EQUS.MINI' AS dataset,
+			'AAPL' AS symbol,
+			make_timestamp_ns(-1) AS ts_event,
+			150.25::DOUBLE AS ask_px
+	) TO ` + literal(pqPath) + ` (FORMAT PARQUET)`)
+	if err != nil {
+		seed.Close()
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openTest(t, Options{Path: ":memory:", AllowedDirs: []string{dir}})
+	err = db.SetAllViews(ctx, ViewSet{
+		Parquet: map[string]string{"raw_bbo": pqPath},
+		SQL: map[string]string{
+			"cache_manifest": `SELECT * FROM (VALUES ('EQUS.MINI', 'bbo-1m', 2)) AS t(dataset, schema_name, row_count)`,
+			"clean_bbo": `SELECT * REPLACE (
+				CASE WHEN ts_event < TIMESTAMP_NS '1970-01-01 00:00:00' THEN NULL ELSE ts_event::TIMESTAMPTZ END AS ts_event,
+				CASE WHEN ask_px > 1e9 THEN NULL ELSE ask_px END AS ask_px
+			) FROM raw_bbo`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify raw TIMESTAMP_NS rendering in CSV and JSONRows without a cast.
+	if rawCSV, err := db.Query(ctx, "SELECT ts_event FROM raw_bbo"); err != nil || !strings.Contains(rawCSV, ".123456789") {
+		t.Fatalf("raw_bbo CSV should preserve nanosecond fractional digits: %q %v", rawCSV, err)
+	}
+	if rawJSON, err := db.QueryFormat(ctx, "SELECT ts_event FROM raw_bbo", JSONRows); err != nil || !strings.Contains(rawJSON, ".123456789") {
+		t.Fatalf("raw_bbo JSONRows should preserve nanosecond fractional digits: %q %v", rawJSON, err)
+	}
+	if err := db.Validate(ctx, "SELECT date_trunc('minute', ts_event), ts_event + INTERVAL 1 MINUTE FROM clean_bbo WHERE ts_event >= TIMESTAMPTZ '2020-01-01 00:00:00Z'"); err != nil {
+		t.Fatalf("clean_bbo TIMESTAMPTZ comparison/date_trunc/interval failed: %v", err)
+	}
+
+	rawCols, err := db.Columns(ctx, "raw_bbo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rawCols) != 4 || rawCols[2] != (Column{Name: "ts_event", Type: "TIMESTAMP_NS"}) {
+		t.Fatalf("unexpected raw_bbo columns: %#v", rawCols)
+	}
+
+	cleanCols, err := db.Columns(ctx, "clean_bbo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleanCols[2] != (Column{Name: "ts_event", Type: "TIMESTAMP WITH TIME ZONE"}) {
+		t.Fatalf("unexpected clean_bbo ts_event column: %#v", cleanCols[2])
+	}
+
+	got, err := db.QueryFormat(ctx, `
+		SELECT b.symbol, m.schema_name, b.ts_event IS NULL AS ts_null, b.ask_px
+		FROM clean_bbo b
+		JOIN cache_manifest m USING (dataset)
+		ORDER BY b.ask_px NULLS FIRST
+	`, JSONRows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"symbol":"AAPL","schema_name":"bbo-1m","ts_null":false,"ask_px":null},{"symbol":"AAPL","schema_name":"bbo-1m","ts_null":true,"ask_px":150.25}]`
+	if got != want {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+
+	if Engine == "duckdb" {
+		tzPath := filepath.Join(dir, "bbo_tz.parquet")
+		seedTZ, err := sql.Open("duckdb", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := seedTZ.Exec(`COPY (SELECT TIMESTAMPTZ_NS '2023-11-14 22:13:20.123456789Z' AS ts_event) TO ` + literal(tzPath) + ` (FORMAT PARQUET)`); err != nil {
+			seedTZ.Close()
+			t.Fatal(err)
+		}
+		if err := seedTZ.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.SetParquetViews(ctx, map[string]string{"raw_bbo": pqPath, "tz_bbo": tzPath}); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Validate(ctx, "SELECT * FROM tz_bbo WHERE ts_event >= TIMESTAMPTZ '2020-01-01 00:00:00Z'"); !errors.Is(err, ErrBinder) {
+			t.Fatalf("expected TIMESTAMPTZ_NS vs TIMESTAMPTZ comparison to fail with ErrBinder, got %v", err)
+		}
 	}
 }

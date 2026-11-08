@@ -47,27 +47,67 @@ func jsonQuery(source string, format Format, maxRows int) string {
 	return rows + "coalesce(to_json(list(t)), '[]')::VARCHAR FROM ntduckbox_page AS t"
 }
 
-// renderJSON reads the single cell produced by jsonQuery within the limits.
-func renderJSON(rows *sql.Rows, maxRows, maxChars int, truncate bool) (Result, error) {
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
+// queryJSON runs jsonQuery and, when truncate is true and the serialized JSON
+// exceeds maxChars, re-runs with a smaller row cap derived from average row
+// size so DuckDB's to_json still produces a valid JSON document within maxChars.
+func queryJSON(ctx context.Context, conn *sql.Conn, source string, format Format, maxRows, maxChars int, truncate bool) (Result, error) {
+	count, text, err := scanJSON(ctx, conn, jsonQuery(source, format, maxRows))
+	if err != nil {
+		return Result{}, err
+	}
+	pageRows := min(count, maxRows)
+	truncated := count > maxRows
+	if truncated && !truncate {
+		return Result{}, ErrResultLimit
+	}
+	if len(text) <= maxChars {
+		return Result{Text: text, Rows: pageRows, Bytes: len(text), Truncated: truncated}, nil
+	}
+	if !truncate || pageRows <= 1 {
+		return Result{}, ErrResultLimit
+	}
+	rowCap := pageRows
+	for len(text) > maxChars && rowCap > 1 {
+		est := int(int64(rowCap) * int64(maxChars) / int64(len(text)))
+		if est >= rowCap {
+			est = rowCap - 1
+		}
+		if est < 1 {
+			est = 1
+		}
+		rowCap = est
+		_, text, err = scanJSON(ctx, conn, jsonQuery(source, format, rowCap))
+		if err != nil {
 			return Result{}, err
 		}
-		return Result{}, errors.New("json result missing")
+		if rowCap == 1 && len(text) > maxChars {
+			return Result{}, ErrResultLimit
+		}
+	}
+	return Result{Text: text, Rows: rowCap, Bytes: len(text), Truncated: true}, nil
+}
+
+func scanJSON(ctx context.Context, conn *sql.Conn, query string) (int, string, error) {
+	rows, err := conn.QueryContext(ctx, query)
+	if err != nil {
+		return 0, "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, "", err
+		}
+		return 0, "", errors.New("json result missing")
 	}
 	var count int
 	var text string
 	if err := rows.Scan(&count, &text); err != nil {
-		return Result{}, err
+		return 0, "", err
 	}
 	if err := rows.Err(); err != nil {
-		return Result{}, err
+		return 0, "", err
 	}
-	res := Result{Text: text, Rows: min(count, maxRows), Truncated: count > maxRows}
-	if (res.Truncated && !truncate) || len(text) > maxChars {
-		return Result{}, ErrResultLimit
-	}
-	return res, nil
+	return count, text, nil
 }
 
 // ErrResultLimit means no partial result was returned. Add a SQL LIMIT, select
@@ -177,5 +217,6 @@ func render(ctx context.Context, rows *sql.Rows, format Format, maxRows, maxChar
 		return Result{}, err
 	}
 	res.Text = out.String()
+	res.Bytes = len(res.Text)
 	return res, nil
 }

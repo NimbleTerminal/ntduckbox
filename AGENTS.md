@@ -19,10 +19,10 @@ Read README.md for the public contract and threat model.
   lock configuration last.
 - Keep the underlying pool private. No write-access option, arbitrary startup
   SQL, runtime extension loading, or user-controlled configuration changes.
-  Host-side catalog mutations (`SetParquetViews`, `SetCSVViews`, `SetViews`)
-  run on in-memory databases only, transactionally, and bound by the engine
-  under the locked settings. Keep `SetParquetViews` and `SetCSVViews` to
-  structured names, paths, and column definitions (never SQL); `SetViews`
+  Host-side catalog mutations (`SetParquetViews`, `SetCSVViews`, `SetViews`,
+  `SetAllViews`) run on in-memory databases only, transactionally, and bound by
+  the engine under the locked settings. Keep `SetParquetViews` and `SetCSVViews`
+  to structured names, paths, and column definitions (never SQL); `SetViews`
   accepts only single-statement `SELECT` bodies validated with `Conn.Prepare`.
 - Preserve native single-statement validation. The driver's PrepareContext can
   execute batch prefixes; it is not a safe replacement for Conn.Prepare here.

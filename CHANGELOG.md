@@ -2,10 +2,14 @@
 
 ## Unreleased (2026-11-08)
 
+ * Add `SetAllViews` (`ViewSet{Parquet, CSV, SQL}`) to replace Parquet, CSV, and SQL views atomically in a single transaction, and enumerate every invalidated SQL view when a standalone `SetParquetViews` or `SetCSVViews` update breaks remaining SQL views.
+ * Add `Validate(ctx, sql)` and sentinel errors `ErrNotSelect`, `ErrPermission`, and `ErrBinder` so hosts can validate queries or classify query rejections with `errors.Is` without maintaining a separate SQL regex allowlist.
+ * Add structured catalog introspection: `Columns(ctx, names...)` returning `[]Column{Name, Type}` (`CSVColumn` is now an alias for `Column`) and `Views(ctx)` returning `[]ViewInfo{Name, Kind, Source}` (`ParquetViewKind`, `CSVViewKind`, `SQLViewKind`).
+ * Add per-call `QueryOptions.MaxChars` (bounded by `Options.MaxChars`), size-based row truncation for `JSONRows` and `JSONColumnar` when `Truncate: true`, and `Result.Bytes` and `Result.Elapsed` metadata.
  * Add `Options.Attach` (`[]Attachment{Path, Alias}`) to attach existing `.duckdb` files read-only at `Open` before disabling external access and locking configuration, adding each attached catalog's `main` schema to `search_path` without allowlisting its parent directory, and document that DuckDB treats attached database files themselves as readable paths.
  * Add `SetCSVViews` (`map[string]CSVView`) to define and replace CSV-backed views in an in-memory database from paths and optional ordered `[]CSVColumn{Name, Type}` definitions, validating the CSV header in order through the locked engine before pinning column types.
  * Add `SetViews` (`map[string]string`) for host-defined SQL views in an in-memory database, wrapping each query body as a subquery, validating it with `Conn.Prepare` (`STATEMENT_TYPE_SELECT`), and creating views in dependency passes under the locked settings. `SetParquetViews`, `SetCSVViews`, and `SetViews` manage independent view sets so CSV views can be swapped at runtime without dropping dependent SQL views, while rejecting Parquet or CSV updates that invalidate remaining SQL views.
- * Document the host-views design, catalog mechanics, and threat-model analysis in `docs/host-views.md`.
+ * Document the host-views design, catalog mechanics, `VALUES`-backed metadata views, `TIMESTAMPTZ_NS` and `SELECT * REPLACE` patterns, and threat-model analysis in `docs/host-views.md`.
 
 ## v0.2.2 (2026-11-07)
 
