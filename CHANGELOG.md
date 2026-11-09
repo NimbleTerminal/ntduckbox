@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## Unreleased (2026-11-08)
+## v0.3.0 (2026-11-08)
 
  * Start `QueryTimeout` after acquiring the pooled connection so queued queries are not penalized by an earlier slow query's execution time, and strip the engine's multi-line `INTERRUPT Error` suffix from timed-out or canceled query errors.
  * Add `Options.TimeZone` (default `"UTC"`) and pin `Calendar = 'gregorian'` before locking configuration, and format top-level `TIMESTAMPTZ` / `TIMESTAMPTZ_NS` and `TIMESTAMP` / `TIMESTAMP_NS` columns in `JSONRows` and `JSONColumnar` as RFC 3339 / ISO 8601 strings inside DuckDB's `to_json` query.
