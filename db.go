@@ -102,10 +102,10 @@ type DB struct {
 	opts       Options
 	searchPath string
 
-	viewsMu         sync.Mutex
-	views           map[string]ViewInfo // Host-managed views in main.
-	resetSearchPath atomic.Bool
-	memory          bool
+	viewsMu    sync.Mutex
+	views      map[string]ViewInfo // Host-managed views in main.
+	searchConn atomic.Pointer[engineConn]
+	memory     bool
 }
 
 // Open opens an existing file read-only or creates an empty in-memory database.
@@ -452,6 +452,25 @@ func (db *DB) replaceViewSet(ctx context.Context, replaceKinds map[ViewKind]bool
 		return cleanExecErr(execCtx, err)
 	}
 	apply := func() error {
+		var brokenBefore map[string]bool
+		if !replaceKinds[SQLViewKind] {
+			for _, name := range slices.Sorted(maps.Keys(db.views)) {
+				if db.views[name].Kind != SQLViewKind {
+					continue
+				}
+				probe := "SELECT * FROM main." + identifier(name)
+				if err := validateSelect(conn, probe, probe); err != nil {
+					if brokenBefore == nil {
+						brokenBefore = make(map[string]bool)
+					}
+					brokenBefore[name] = true
+					db.rollback(conn)
+					if _, rbErr := conn.ExecContext(execCtx, "BEGIN TRANSACTION"); rbErr != nil {
+						return rbErr
+					}
+				}
+			}
+		}
 		created := make([]string, 0, len(names))
 		createdSQL := make(map[string]string, len(names))
 		resetTx := func() error {
@@ -513,7 +532,7 @@ func (db *DB) replaceViewSet(ctx context.Context, replaceKinds map[ViewKind]bool
 		if !replaceKinds[SQLViewKind] {
 			var broken []error
 			for _, name := range slices.Sorted(maps.Keys(db.views)) {
-				if db.views[name].Kind != SQLViewKind {
+				if db.views[name].Kind != SQLViewKind || brokenBefore[name] {
 					continue
 				}
 				probe := "SELECT * FROM main." + identifier(name)
@@ -558,14 +577,21 @@ func (db *DB) conn(ctx context.Context) (*sql.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if db.searchPath != "" && db.resetSearchPath.Load() {
-		setupCtx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
-		defer cancel()
-		if _, err := conn.ExecContext(setupCtx, "SET search_path = "+literal(db.searchPath)); err != nil {
-			_ = conn.Close()
-			return nil, cleanExecErr(setupCtx, err)
+	if db.searchPath != "" {
+		var rawConn *engineConn
+		_ = conn.Raw(func(raw any) error {
+			rawConn, _ = raw.(*engineConn)
+			return nil
+		})
+		if rawConn == nil || db.searchConn.Load() != rawConn {
+			setupCtx, cancel := context.WithTimeout(ctx, db.opts.QueryTimeout)
+			defer cancel()
+			if _, err := conn.ExecContext(setupCtx, "SET search_path = "+literal(db.searchPath)); err != nil {
+				_ = conn.Close()
+				return nil, cleanExecErr(setupCtx, err)
+			}
+			db.searchConn.Store(rawConn)
 		}
-		db.resetSearchPath.Store(false)
 	}
 	return conn, nil
 }
@@ -573,7 +599,7 @@ func (db *DB) conn(ctx context.Context) (*sql.Conn, error) {
 func (db *DB) rollback(conn *sql.Conn) {
 	if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
 		// Never return a connection with unknown transaction state to the pool.
-		db.resetSearchPath.Store(true)
+		db.searchConn.Store(nil)
 		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 	}
 }

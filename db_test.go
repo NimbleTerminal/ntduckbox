@@ -3,6 +3,7 @@ package ntduckbox
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"math"
@@ -509,8 +510,8 @@ func TestAttachAndIsolation(t *testing.T) {
 		}
 	}
 
-	// Disposing of the pooled connection (as rollback does on failure) must
-	// restore search_path on the replacement connection.
+	// Disposing of the pooled connection (via rollback or directly via
+	// driver.ErrBadConn) must restore search_path on the replacement connection.
 	conn, err := db.pool.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -518,7 +519,16 @@ func TestAttachAndIsolation(t *testing.T) {
 	db.rollback(conn)
 	_ = conn.Close()
 	if got, err := db.Query(ctx, "SELECT registration_number FROM ct_brands"); err != nil || got != "registration_number\nC0000000001\n" {
-		t.Fatalf("unqualified query after bad-connection recovery: %q %v", got, err)
+		t.Fatalf("unqualified query after rollback bad-connection recovery: %q %v", got, err)
+	}
+	conn, err = db.pool.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	_ = conn.Close()
+	if got, err := db.Query(ctx, "SELECT registration_number FROM ct_brands"); err != nil || got != "registration_number\nC0000000001\n" {
+		t.Fatalf("unqualified query after direct connection replacement: %q %v", got, err)
 	}
 
 	// DuckDB treats an attached database file as an implicit readable path even
@@ -1076,6 +1086,20 @@ func TestQueryWith(t *testing.T) {
 	if err != nil || res.Text != `{"i":[0,1]}` || res.Rows != 2 || !res.Truncated || res.Bytes != 11 {
 		t.Fatalf("JSONColumnar MaxChars truncate: %#v %v", res, err)
 	}
+
+	// Skewed row sizes (9 tiny rows + 1 5000-byte row): binary search must find
+	// the largest whole-row prefix (9 rows, 91 bytes) rather than stopping at the
+	// average-size estimate (1 row, 11 bytes).
+	dbSkew := openTest(t, Options{MaxRows: 20, MaxChars: 10000})
+	skewSQL := "SELECT CASE WHEN i < 9 THEN 'a' ELSE repeat('x', 5000) END AS s FROM range(10) r(i) ORDER BY i"
+	res, err = dbSkew.QueryWith(ctx, skewSQL, QueryOptions{MaxChars: 250, Truncate: true, Format: JSONRows})
+	if err != nil || res.Rows != 9 || !res.Truncated || res.Bytes != 91 {
+		t.Fatalf("skewed JSONRows MaxChars truncate: %#v %v", res, err)
+	}
+	res, err = dbSkew.QueryWith(ctx, skewSQL, QueryOptions{MaxChars: 250, Truncate: true, Format: JSONColumnar})
+	if err != nil || res.Rows != 9 || !res.Truncated {
+		t.Fatalf("skewed JSONColumnar MaxChars truncate: %#v %v", res, err)
+	}
 }
 
 func TestSetAllViewsAndInvalidation(t *testing.T) {
@@ -1190,6 +1214,7 @@ func TestSetAllViewsAndInvalidation(t *testing.T) {
 	}
 	if err := db.SetAllViews(ctx, ViewSet{
 		Parquet: map[string]string{"live_glob": globPattern},
+		SQL:     map[string]string{"glob_sql": "SELECT * FROM live_glob"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1197,11 +1222,21 @@ func TestSetAllViewsAndInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	views, err := db.Views(ctx)
-	if err != nil || len(views) != 1 || views[0].Name != "live_glob" {
-		t.Fatalf("expected live_glob to remain registered after file removal, got %v %v", views, err)
+	if err != nil || len(views) != 2 || views[1].Name != "live_glob" {
+		t.Fatalf("expected glob_sql and live_glob to remain registered after file removal, got %v %v", views, err)
 	}
 	if _, err := db.Query(ctx, "SELECT * FROM live_glob"); err == nil {
 		t.Fatal("querying Parquet glob after all files removed succeeded")
+	}
+	// A pre-existing broken SQL view (glob_sql) must not block an unrelated
+	// SetCSVViews call from creating or updating its own views.
+	if err := db.SetCSVViews(ctx, map[string]CSVView{
+		"meta": {Path: metaCSV, Columns: []Column{{Name: "symbol", Type: "VARCHAR"}, {Name: "venue", Type: "VARCHAR"}}},
+	}); err != nil {
+		t.Fatalf("unrelated SetCSVViews blocked by pre-existing broken SQL view: %v", err)
+	}
+	if got, err := db.Query(ctx, "SELECT symbol, venue FROM meta"); err != nil || got != "symbol,venue\nAAPL,XNAS\n" {
+		t.Fatalf("meta after SetCSVViews: %q %v", got, err)
 	}
 }
 
@@ -1610,6 +1645,21 @@ func TestTimeZoneCalendarAndJSONTimestamps(t *testing.T) {
 	if err != nil || gotNYAfter != `[{"tstz":"2026-09-01T04:01:42.622909-04:00"}]` {
 		t.Fatalf("America/New_York after connection replacement: %s %v", gotNYAfter, err)
 	}
+
+	// A DESCRIBE failure inside queryJSON must return the underlying error
+	// directly rather than running the fallback query on an aborted transaction.
+	conn, err = dbNY.conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN TRANSACTION READ ONLY"); err != nil {
+		_ = conn.Close()
+		t.Fatal(err)
+	}
+	_, err = queryJSON(ctx, conn, "SELECT * FROM no_such_table", JSONRows, 10, 1000, false)
+	dbNY.rollback(conn)
+	_ = conn.Close()
+	assertEngineError(t, err, engineErrorCatalog, "no_such_table")
 }
 
 func TestStatementSurfacePivotAndExplain(t *testing.T) {

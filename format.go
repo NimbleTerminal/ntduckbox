@@ -48,8 +48,9 @@ func jsonQuery(source string, format Format, maxRows int) string {
 }
 
 // queryJSON runs jsonQuery and, when truncate is true and the serialized JSON
-// exceeds maxChars, re-runs with a smaller row cap derived from average row
-// size so DuckDB's to_json still produces a valid JSON document within maxChars.
+// exceeds maxChars, binary-searches the row cap (starting from the average-size
+// estimate) so DuckDB's to_json returns the largest whole-row prefix within
+// maxChars.
 func queryJSON(ctx context.Context, conn *sql.Conn, source string, format Format, maxRows, maxChars int, truncate bool) (Result, error) {
 	if !strings.HasPrefix(source, "DESCRIBE ") {
 		rewritten, err := rewriteJSONTimestamps(ctx, conn, source)
@@ -73,25 +74,28 @@ func queryJSON(ctx context.Context, conn *sql.Conn, source string, format Format
 	if !truncate || pageRows <= 1 {
 		return Result{}, ErrResultLimit
 	}
-	rowCap := pageRows
-	for len(text) > maxChars && rowCap > 1 {
-		est := int(int64(rowCap) * int64(maxChars) / int64(len(text)))
-		if est >= rowCap {
-			est = rowCap - 1
-		}
-		if est < 1 {
-			est = 1
-		}
-		rowCap = est
-		_, text, err = scanJSON(ctx, conn, jsonQuery(source, format, rowCap))
+	lo, hi := 1, pageRows-1
+	mid := min(max(int(int64(pageRows)*int64(maxChars)/int64(len(text))), lo), hi)
+	bestRows := 0
+	var bestText string
+	for lo <= hi {
+		_, candidate, err := scanJSON(ctx, conn, jsonQuery(source, format, mid))
 		if err != nil {
 			return Result{}, err
 		}
-		if rowCap == 1 && len(text) > maxChars {
-			return Result{}, ErrResultLimit
+		if len(candidate) <= maxChars {
+			bestRows = mid
+			bestText = candidate
+			lo = mid + 1
+		} else {
+			hi = mid - 1
 		}
+		mid = lo + (hi-lo)/2
 	}
-	return Result{Text: text, Rows: rowCap, Bytes: len(text), Truncated: true}, nil
+	if bestRows == 0 {
+		return Result{}, ErrResultLimit
+	}
+	return Result{Text: bestText, Rows: bestRows, Bytes: len(bestText), Truncated: true}, nil
 }
 
 // rewriteJSONTimestamps wraps source with SELECT * REPLACE (...) when top-level
@@ -101,7 +105,7 @@ func queryJSON(ctx context.Context, conn *sql.Conn, source string, format Format
 func rewriteJSONTimestamps(ctx context.Context, conn *sql.Conn, source string) (string, error) {
 	rows, err := conn.QueryContext(ctx, "DESCRIBE "+source)
 	if err != nil {
-		return source, nil
+		return "", err
 	}
 	defer rows.Close()
 	type colMeta struct {
