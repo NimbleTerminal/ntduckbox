@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/Query-farm-haybarn/haybarn-go/v2 v2.10506.0
 	github.com/duckdb/duckdb-go/v2 v2.20000.0
-	github.com/mark3labs/mcp-go v1.5.0
+	github.com/mark3labs/mcp-go v1.6.0
 )
 
 require (
